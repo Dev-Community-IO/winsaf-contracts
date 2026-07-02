@@ -14,7 +14,7 @@
 
 **WinSaf** is a non-custodial Telegram lottery on [Safrochain](https://safrochain.com). This repository contains the **open-source CosmWasm smart contract** — lottery, treasury, referral, and verifiable randomness in **one consolidated contract**.
 
-The product stack (Mini App, API, MPC wallet, bot) lives in the private [`winsaf`](https://github.com/Dev-Community-IO/winsaf) monorepo.
+The product stack (Mini App, API, MPC wallet, bot) lives in the private [`winsaf`](https://github.com/Dev-Community-IO/winsaf) monorepo, with this repo checked out as a **git submodule** at `contracts/cosmwasm/`.
 
 ## Live deployment (testnet)
 
