@@ -31,7 +31,7 @@ cw-storage-plus = "^2.0"
 cw2 = "^2.0"
 cw-utils = "^2.0"
 thiserror = "^1"
-schemars = "0.8"
+schemars = "1.2"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 
 # Internal crate — referenced by contracts as `{ workspace = true }`.
