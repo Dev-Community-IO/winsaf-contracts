@@ -8,7 +8,8 @@
 #
 # Stores artifacts/winsaf.wasm, instantiates it (mock/dev randomness for
 # testnet, sender as authorized submitter), then writes the address + code id
-# into ../../config/chains/<network>.json and ./deployment-<network>.json.
+# into ./deployment-<network>.json and (optionally) the main app monorepo
+# config/chains/<network>.json when WINSAF_MONOREPO_ROOT is set.
 #
 # SAFETY: mainnet is refused unless WINSAF_ALLOW_MAINNET=iunderstand is set.
 # ============================================================================
@@ -29,18 +30,28 @@ fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CW_ROOT="$(cd "$HERE/.." && pwd)"
-REPO_ROOT="$(cd "$CW_ROOT/../.." && pwd)"
-CHAIN_JSON="$REPO_ROOT/config/chains/$NETWORK.json"
+MONOREPO_ROOT="${WINSAF_MONOREPO_ROOT:-}"
+CHAIN_JSON="${WINSAF_CHAIN_JSON:-}"
+if [[ -z "$CHAIN_JSON" && -n "$MONOREPO_ROOT" ]]; then
+  CHAIN_JSON="$MONOREPO_ROOT/config/chains/$NETWORK.json"
+fi
 WASM="$CW_ROOT/artifacts/winsaf.wasm"
 DEPLOY_OUT="$CW_ROOT/deployment-$NETWORK.json"
 
 command -v safrochaind >/dev/null || die "safrochaind not found"
 command -v jq >/dev/null || die "jq not found"
-[[ -f "$CHAIN_JSON" ]] || die "chain config not found: $CHAIN_JSON"
 [[ -f "$WASM" ]] || die "optimized wasm not found: $WASM (run ./scripts/optimize.sh first)"
 
-CHAIN_ID="$(jq -r '.chainId' "$CHAIN_JSON")"
-RPC="${CHAIN_RPC_URL:-$(jq -r '.endpoints.rpc' "$CHAIN_JSON")}"
+if [[ -n "$CHAIN_JSON" && ! -f "$CHAIN_JSON" ]]; then
+  die "chain config not found: $CHAIN_JSON"
+fi
+if [[ -f "$CHAIN_JSON" ]]; then
+  CHAIN_ID="$(jq -r '.chainId' "$CHAIN_JSON")"
+  RPC="${CHAIN_RPC_URL:-$(jq -r '.endpoints.rpc' "$CHAIN_JSON")}"
+else
+  CHAIN_ID="${CHAIN_ID:-safro-testnet-1}"
+  RPC="${CHAIN_RPC_URL:-https://rpc.testnet.safrochain.com}"
+fi
 DENOM="usaf"
 GAS_PRICES="0.025${DENOM}"
 KOPTS="--keyring-backend $KEYRING_BACKEND"
@@ -100,19 +111,32 @@ HASH="$(echo "$RES" | jq -r '.txhash // empty')"; TX="$(wait_tx "$HASH")"
 ADDR="$(attr "$TX" instantiate _contract_address)"; [[ -n "$ADDR" ]] || die "no _contract_address"
 ok "instantiated — $ADDR (tx $HASH)"
 
-# ---- write config (single address fills all contract slots the apps read) ----
-say "── writing $CHAIN_JSON + $DEPLOY_OUT ──"
-tmp="$(mktemp)"
-jq --arg a "$ADDR" --argjson c "$CODE_ID" \
-  '.contracts.winsaf=$a | .contracts.lottery=$a | .contracts.treasury=$a | .contracts.referral=$a | .contracts.randomnessBeacon=$a
-   | .codeIds.winsaf=$c' "$CHAIN_JSON" > "$tmp" && mv "$tmp" "$CHAIN_JSON"
+# ---- write deployment record (+ optional monorepo chain config) ----
+say "── writing $DEPLOY_OUT ──"
 jq -n --arg net "$NETWORK" --arg cid "$CHAIN_ID" --arg admin "$ADMIN" --arg a "$ADDR" --argjson c "$CODE_ID" \
   '{network:$net, chainId:$cid, admin:$admin, contract:$a, codeId:$c,
-    note:"Single consolidated winsaf contract (lottery+treasury+referral+randomness)."}' > "$DEPLOY_OUT"
+    note:"Single winsaf contract with drand+BLS randomness and Must-Be-Won rolldown."}' > "$DEPLOY_OUT"
+
+if [[ -f "$MONOREPO_ROOT/config/chains/$NETWORK.json" ]]; then
+  CHAIN_JSON="$MONOREPO_ROOT/config/chains/$NETWORK.json"
+  say "── updating $CHAIN_JSON ──"
+  tmp="$(mktemp)"
+  jq --arg a "$ADDR" --argjson c "$CODE_ID" \
+    '.contracts.winsaf=$a | .contracts.lottery=$a | .contracts.treasury=$a | .contracts.referral=$a | .contracts.randomnessBeacon=$a
+     | .codeIds.winsaf=$c' "$CHAIN_JSON" > "$tmp" && mv "$tmp" "$CHAIN_JSON"
+  ok "updated monorepo chain config"
+else
+  warn "Set WINSAF_MONOREPO_ROOT to auto-update config/chains/$NETWORK.json in the winsaf app repo"
+fi
+
+EXPLORER="${WINSAF_EXPLORER_URL:-https://explorer.testnet.safrochain.com}"
+if [[ -f "$CHAIN_JSON" ]]; then
+  EXPLORER="$(jq -r '.endpoints.explorer // empty' "$CHAIN_JSON")"
+fi
 
 echo; ok "DEPLOYED winsaf to $CHAIN_ID"
 echo -e "   contract  ${GREEN}$ADDR${NC}"
 echo -e "   code_id   ${GREEN}$CODE_ID${NC}"
 echo -e "   admin     $ADMIN"
-echo -e "   explorer  $(jq -r '.endpoints.explorer' "$CHAIN_JSON")/account/$ADDR"
-echo -e "   → written to $CHAIN_JSON and $DEPLOY_OUT"
+echo -e "   explorer  ${EXPLORER}/account/$ADDR"
+echo -e "   → written to $DEPLOY_OUT"

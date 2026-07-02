@@ -8,13 +8,14 @@
 //! ever consumed by a draw.
 //!
 //! # drand verification (the real thing)
-//! drand's "unchained" / quicknet scheme works as follows:
+//! drand **quicknet** (`bls-unchained-g1-rfc9380`) works as follows:
 //!
-//! - The group public key `pk` is a point in **G1** (48 bytes, compressed).
+//! - The group public key `pk` is a point in **G2** (96 bytes, compressed).
 //! - For beacon `round`, the signed message is `H = sha256(round_be_bytes)`
 //!   (unchained: the previous signature is NOT mixed in).
-//! - The signature `sig` is a point in **G2** (96 bytes, compressed).
-//! - Verification is the pairing check `e(G1_gen, sig) == e(pk, hash_to_G2(H))`,
+//! - The signature `sig` is a point in **G1** (48 bytes, compressed) — quicknet
+//!   uses short G1 signatures.
+//! - Verification is the pairing check `e(sig, G2_gen) == e(hash_to_G1(H), pk)`,
 //!   evaluated with the host BLS primitives.
 //! - The delivered `randomness` is then `sha256(sig)` — we recompute it and
 //!   require a match, so the 32-byte value a draw consumes is provably bound to
@@ -35,16 +36,17 @@ use sha2::{Digest, Sha256};
 use crate::error::ContractError;
 use crate::state::VerifyMode;
 
-/// BLS12-381 G1 compressed point length (drand group public key).
+/// BLS12-381 G1 compressed point length (drand quicknet round signature).
 pub const G1_LEN: usize = 48;
-/// BLS12-381 G2 compressed point length (drand round signature).
+/// BLS12-381 G2 compressed point length (drand quicknet group public key).
 pub const G2_LEN: usize = 96;
 /// Length of a beacon randomness value / SHA-256 digest.
 pub const RANDOMNESS_LEN: usize = 32;
 
-/// Domain separation tag for drand's hash-to-curve on G2 (RFC 9380,
-/// `BLS12381G2_XMD:SHA-256_SSWU_RO_`, NUL ciphersuite as used by drand).
-const DRAND_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+/// Domain separation tag for drand quicknet's hash-to-curve on G1 (RFC 9380,
+/// `BLS12381G1_XMD:SHA-256_SSWU_RO_`, NUL ciphersuite) — the `bls-unchained-
+/// g1-rfc9380` scheme quicknet uses (short G1 signatures, G2 group pubkey).
+const DRAND_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// The drand message for a given round under the unchained scheme:
 /// `sha256(round.to_be_bytes())`.
@@ -80,9 +82,9 @@ pub fn verify_drand(
             actual: randomness.len(),
         });
     }
-    if signature.len() != G2_LEN {
+    if signature.len() != G1_LEN {
         return Err(ContractError::verification_failed(format!(
-            "drand signature must be {G2_LEN} bytes (G2), got {}",
+            "drand signature must be {G1_LEN} bytes (G1), got {}",
             signature.len()
         )));
     }
@@ -102,27 +104,29 @@ pub fn verify_drand(
             Ok(())
         }
         VerifyMode::Bls => {
-            if pubkey.len() != G1_LEN {
+            if pubkey.len() != G2_LEN {
                 return Err(ContractError::InvalidPubkey {
-                    reason: format!("drand group pubkey must be {G1_LEN} bytes (G1)"),
+                    reason: format!("drand group pubkey must be {G2_LEN} bytes (G2)"),
                 });
             }
 
-            // H = hash_to_G2(sha256(round))
+            // quicknet (bls-unchained-g1-rfc9380): the message hashes to G1 and
+            // the signature is a G1 point; the group pubkey is a G2 point.
+            // H = hash_to_G1(sha256(round))
             let msg = drand_message(round);
             let hashed_on_curve = api
-                .bls12_381_hash_to_g2(HashFunction::Sha256, &msg, DRAND_DST)
+                .bls12_381_hash_to_g1(HashFunction::Sha256, &msg, DRAND_DST)
                 .map_err(|e| {
-                    ContractError::verification_failed(format!("hash_to_g2 failed: {e}"))
+                    ContractError::verification_failed(format!("hash_to_g1 failed: {e}"))
                 })?;
 
-            // Pairing check: e(G1_gen, sig) == e(pk, H)
+            // Pairing check: e(sig, G2_gen) == e(H, pk)
             let ok = api
                 .bls12_381_pairing_equality(
-                    &cosmwasm_std::BLS12_381_G1_GENERATOR,
                     signature,
-                    pubkey,
+                    &cosmwasm_std::BLS12_381_G2_GENERATOR,
                     &hashed_on_curve,
+                    pubkey,
                 )
                 .map_err(|e| {
                     ContractError::verification_failed(format!("pairing check errored: {e}"))
@@ -184,7 +188,7 @@ mod tests {
     #[test]
     fn dev_verifier_binds_randomness_to_signature() {
         let api = cosmwasm_std::testing::MockApi::default();
-        let sig = HexBinary::from(vec![3u8; G2_LEN]);
+        let sig = HexBinary::from(vec![3u8; G1_LEN]);
         let good = HexBinary::from(sha256(sig.as_slice()));
         assert!(verify_drand(&api, &VerifyMode::Dev, &[], 7, &good, sig.as_slice()).is_ok());
 
@@ -196,7 +200,7 @@ mod tests {
     #[test]
     fn bls_verifier_rejects_wrong_pubkey_len() {
         let api = cosmwasm_std::testing::MockApi::default();
-        let sig = HexBinary::from(vec![3u8; G2_LEN]);
+        let sig = HexBinary::from(vec![3u8; G1_LEN]);
         let rnd = HexBinary::from(sha256(sig.as_slice()));
         let err =
             verify_drand(&api, &VerifyMode::Bls, &[0u8; 10], 7, &rnd, sig.as_slice()).unwrap_err();

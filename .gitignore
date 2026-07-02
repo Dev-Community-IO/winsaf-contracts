@@ -11,11 +11,3 @@
 # Local editor / OS cruft
 *.swp
 .DS_Store
-
-# Secrets — never commit
-.env
-.env.*
-*.pem
-*.key
-credentials.env
-deployment-local.json

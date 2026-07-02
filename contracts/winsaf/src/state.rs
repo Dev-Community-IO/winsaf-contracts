@@ -33,6 +33,27 @@ use cosmwasm_std::{Addr, Coin, HexBinary, Uint128};
 use cw_storage_plus::{Item, Map};
 use winsaf_shared::{FundSplitBps, RoundStatus};
 
+/// Minimum number of blocks that must elapse between a commit-reveal commitment
+/// and its reveal. Because the reveal seed also mixes the reveal block's
+/// height/time (which are unknown at commit time), forcing a strictly-later
+/// block prevents the submitter from precomputing the draw outcome at commit.
+pub const MIN_REVEAL_DELAY_BLOCKS: u64 = 1;
+
+/// Default `reveal_timeout` (seconds): after a commitment lands, how long to
+/// wait for the reveal before the round becomes recoverable via `CancelRound`.
+pub const DEFAULT_REVEAL_TIMEOUT_SECONDS: u64 = 3600;
+
+/// Grace period (seconds) after a round's `closes_at` before ANYONE
+/// (permissionless) may cancel a stuck `Drawing` round whose randomness never
+/// fulfilled. The admin may cancel a stuck round without waiting for this.
+pub const CANCEL_GRACE_SECONDS: u64 = 86_400;
+
+/// drand quicknet beacon genesis time (unix seconds) — default when a drand
+/// contract does not override it. https://api.drand.sh/<quicknet>/info
+pub const DRAND_QUICKNET_GENESIS: u64 = 1_692_803_367;
+/// drand quicknet beacon period (seconds) — default when not overridden.
+pub const DRAND_QUICKNET_PERIOD: u64 = 3;
+
 // ===========================================================================
 // Randomness configuration types (ported from randomness-beacon)
 // ===========================================================================
@@ -107,11 +128,54 @@ pub struct Config {
     pub drand_pubkey: HexBinary,
     /// drand chain hash — identifies the beacon chain the pubkey belongs to.
     pub drand_chain_hash: String,
+    /// drand beacon genesis time (unix seconds). Used to derive the beacon round
+    /// bound to a round's `closes_at`, so the beacon a draw consumes is the FIRST
+    /// drand round published strictly AFTER close — unknowable at buy/close time
+    /// (quicknet: 1692803367). Zero in non-drand modes.
+    #[serde(default)]
+    pub drand_genesis_time: u64,
+    /// drand beacon period in seconds (quicknet: 3). Zero in non-drand modes.
+    #[serde(default)]
+    pub drand_period: u64,
     /// Addresses permitted to submit randomness / commit / reveal. The admin is
     /// always implicitly authorized.
     pub authorized_submitters: Vec<Addr>,
     /// Minimum accrued earnings (usaf) a referrer must hold before `ClaimReferral`.
     pub min_claim_usaf: Uint128,
+    /// Seconds after a commit-reveal commitment lands before the round may be
+    /// cancelled/recovered when the reveal never arrives. Also gates the minimum
+    /// reveal delay window together with [`MIN_REVEAL_DELAY_BLOCKS`]. Default 3600.
+    ///
+    /// `#[serde(default)]` so a Config persisted by a pre-upgrade code version
+    /// (which lacked this field) still deserializes across a code migration; the
+    /// admin can then set a non-zero value via `SetConfig`.
+    #[serde(default)]
+    pub reveal_timeout: u64,
+    /// When `false` (default), `RegisterCode` is admin-only so reserved
+    /// brand/influencer referral codes cannot be squatted. When `true`, anyone
+    /// may register an unused code (legacy permissionless behaviour).
+    ///
+    /// `#[serde(default)]` for backward-compatible migration (defaults to the
+    /// safe closed/admin-only behaviour on upgrade).
+    #[serde(default)]
+    pub open_code_registration: bool,
+    /// "Must Be Won" cap: the maximum number of consecutive dry rounds (no
+    /// match-6 jackpot winner) the jackpot allocation may roll over before it is
+    /// FORCED to roll DOWN to the best-matching lower tier present, guaranteeing
+    /// distribution. `0` disables the feature (unlimited rollover — the legacy
+    /// behaviour). Default 5.
+    ///
+    /// `#[serde(default = "default_max_dry_rounds")]` so a Config persisted by a
+    /// pre-upgrade code version (which lacked this field) still deserializes
+    /// across a code migration, defaulting to 5.
+    #[serde(default = "default_max_dry_rounds")]
+    pub max_dry_rounds: u64,
+}
+
+/// Default cap on consecutive dry rounds before a forced jackpot rolldown.
+/// Also the serde default so pre-upgrade Configs deserialize with this value.
+pub fn default_max_dry_rounds() -> u64 {
+    5
 }
 
 impl Config {
@@ -174,6 +238,19 @@ pub struct Round {
     pub rolled_over_from: Option<u64>,
     /// Number of tickets that won a non-zero prize (any tier).
     pub winning_tickets: u64,
+    /// Running SHA-256 accumulator of ticket-derived entropy for this round.
+    ///
+    /// On every buy this folds in `(previous_entropy || buyer || ticket_id ||
+    /// picks)` for each materialised ticket. It is used as a defense-in-depth
+    /// entropy source when a commit-reveal seed is finalised at reveal time: the
+    /// full ticket set (and therefore this value) is not known when the submitter
+    /// must post their commitment during the `Open` phase, so it cannot be
+    /// ground offline. 32 bytes; all-zero for a round with no buys.
+    ///
+    /// `#[serde(default)]` so a Round persisted before this upgrade (which lacked
+    /// the field) still deserializes; it defaults to all-zero entropy.
+    #[serde(default)]
+    pub ticket_entropy: [u8; 32],
 }
 
 impl Round {
@@ -197,6 +274,7 @@ impl Round {
             prize_tiers: PrizeTiers::default(),
             rolled_over_from,
             winning_tickets: 0,
+            ticket_entropy: [0u8; 32],
         }
     }
 }
@@ -214,6 +292,15 @@ pub struct Ticket {
     pub prize: Uint128,
     /// Whether the prize has been claimed. Guards double-spend.
     pub claimed: bool,
+    /// Whether this ticket was granted free (operator-sponsored bonus ticket via
+    /// `GrantBonusTicket`) rather than paid for by the owner. A free ticket is
+    /// still fully funded (the operator sponsors its pool contribution) so it
+    /// wins/claims exactly like a paid ticket; this flag is informational only.
+    ///
+    /// `#[serde(default)]` so a Ticket persisted before this upgrade (which
+    /// lacked the field) still deserializes, defaulting to `false` (paid).
+    #[serde(default)]
+    pub free: bool,
 }
 
 // ===========================================================================
@@ -266,6 +353,22 @@ pub struct RandomnessRequest {
     pub randomness: Option<HexBinary>,
     /// The beacon signature that was verified (audit trail). `None` otherwise.
     pub signature: Option<HexBinary>,
+    /// Commit-reveal: the submitter that posted the commitment. Only this exact
+    /// address may reveal (accountability + binding). `None` until a commit lands.
+    ///
+    /// `#[serde(default)]` so pre-upgrade `RandomnessRequest` entries (which
+    /// lacked these fields) still deserialize, defaulting to `None`.
+    #[serde(default)]
+    pub committer: Option<Addr>,
+    /// Commit-reveal: block height at which the commitment was posted. The reveal
+    /// must occur at a strictly later height (a minimum-delay window) so the
+    /// outcome cannot be precomputed at commit time. `None` until a commit lands.
+    #[serde(default)]
+    pub commit_height: Option<u64>,
+    /// Commit-reveal: unix-seconds deadline after which, if the reveal never
+    /// arrives, the round may be cancelled/recovered. `None` until a commit lands.
+    #[serde(default)]
+    pub reveal_deadline: Option<u64>,
 }
 
 // ===========================================================================
@@ -278,6 +381,12 @@ pub const CONFIG: Item<Config> = Item::new("config");
 
 /// Id of the round currently accepting tickets.
 pub const CURRENT_ROUND: Item<u64> = Item::new("current_round");
+
+/// "Must Be Won" streak counter: the number of consecutive SETTLED rounds that
+/// ended with NO jackpot (match-6) winner AND were not force-distributed. Reset
+/// to 0 whenever a round pays the jackpot naturally or triggers a forced
+/// rolldown. Absent (pre-upgrade / never settled) is treated as 0.
+pub const DRY_STREAK: Item<u64> = Item::new("dry_streak");
 
 /// All rounds keyed by id.
 pub const ROUNDS: Map<u64, Round> = Map::new("rounds");

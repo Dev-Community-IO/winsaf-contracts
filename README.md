@@ -21,8 +21,8 @@ The product stack (Mini App, API, MPC wallet, bot) lives in the private [`winsaf
 | Field | Value |
 |-------|-------|
 | Network | `safro-testnet-1` |
-| Contract | [`addr_safro14c70k3s6uqnywq3jfrhcrdvl3cq4atse0cvwjxm65hy0khesnunq534cka`](https://explorer.testnet.safrochain.com/account/addr_safro14c70k3s6uqnywq3jfrhcrdvl3cq4atse0cvwjxm65hy0khesnunq534cka) |
-| Code ID | `142` |
+| Contract | [`addr_safro1aqkst3m7cvv9ku9nfcq8w3njl8w37fsjjff64kqmjfxvpht3gwnqqdveaq`](https://explorer.testnet.safrochain.com/account/addr_safro1aqkst3m7cvv9ku9nfcq8w3njl8w37fsjjff64kqmjfxvpht3gwnqqdveaq) |
+| Code ID | `146` |
 | Ticket price | 5 SAF (`5_000_000 usaf`) |
 | Fund split | 75% prize · 10% referral · 15% treasury |
 

@@ -20,7 +20,25 @@
 //!   Drawing ──SubmitRandomness / CommitRandomness+RevealRandomness──▶ Drawing
 //!             (randomness fulfilled in-contract, verified per mode)
 //!   Drawing ──Draw──▶ Settled (prizes fixed, next round opened, maybe rollover)
+//!   Drawing ──CancelRound (randomness never fulfilled)──▶ Cancelled
+//!             (retained pool becomes pro-rata pull-refunds, next round opened)
 //! ```
+//!
+//! # Randomness fairness & recommended production mode
+//!
+//! For PRODUCTION the recommended configuration is **Drand + BLS**
+//! (`randomness_mode = Drand`, `verify_mode = Bls`) wired to a real drand beacon
+//! (`drand_pubkey` + `drand_chain_hash`) and an actual relayer. In that mode the
+//! consumed randomness is an externally-verified beacon signature the submitter
+//! cannot grind — [`crate::verify::verify_drand`] enforces the BLS pairing.
+//!
+//! `CommitReveal` is a defense-in-depth fallback for testnet. It is hardened so a
+//! single submitter cannot pick the outcome: the finalised seed mixes a
+//! per-round ticket-entropy accumulator and the reveal block's height/time
+//! (neither known when the commitment must be posted during `Open`), the
+//! commitment is bound to the committer, and the reveal is forced to a strictly
+//! later block. `Mock`/`Dev` remain localnet-only and can never be switched into
+//! a production wasm via `SetConfig` (compile-gated behind `dev-randomness`).
 
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
@@ -42,11 +60,13 @@ use crate::msg::{
     ReferrerResponse, RoundResponse, TicketInfo, TicketsResponse, TreasuryBalanceResponse,
 };
 use crate::state::{
-    Config, PrizeTiers, RandomnessMode, RandomnessRequest, RandomnessStatus, Round, Ticket,
-    VerifyMode, CONFIG, CURRENT_ROUND, PLAYERS, RANDOMNESS, REFERRAL_CODES,
-    REFERRAL_EARNINGS, REFERRAL_TOTALS, REFERRER, ROUNDS, TICKETS, TICKET_SEQ, TREASURY,
+    default_max_dry_rounds, Config, PrizeTiers, RandomnessMode, RandomnessRequest,
+    RandomnessStatus, Round, Ticket, VerifyMode, CANCEL_GRACE_SECONDS, CONFIG, CURRENT_ROUND,
+    DEFAULT_REVEAL_TIMEOUT_SECONDS, DRAND_QUICKNET_GENESIS, DRAND_QUICKNET_PERIOD, DRY_STREAK,
+    MIN_REVEAL_DELAY_BLOCKS, PLAYERS, RANDOMNESS, REFERRAL_CODES, REFERRAL_EARNINGS,
+    REFERRAL_TOTALS, REFERRER, ROUNDS, TICKETS, TICKET_SEQ, TREASURY,
 };
-use crate::verify::{sha256, verify_drand, verify_mock, verify_reveal, G1_LEN};
+use crate::verify::{sha256, verify_drand, verify_mock, verify_reveal, G2_LEN};
 
 // --- Contract identity (cw2) ------------------------------------------------
 
@@ -120,6 +140,8 @@ pub fn instantiate(
     let verify_mode = msg.verify_mode.unwrap_or(VerifyMode::Dev);
     let drand_pubkey = msg.drand_pubkey.unwrap_or_default();
     let drand_chain_hash = msg.drand_chain_hash.unwrap_or_default();
+    let drand_genesis_time = msg.drand_genesis_time.unwrap_or(DRAND_QUICKNET_GENESIS);
+    let drand_period = msg.drand_period.unwrap_or(DRAND_QUICKNET_PERIOD);
 
     let authorized_submitters = validate_addrs(deps.as_ref(), &msg.authorized_submitters)?;
 
@@ -137,14 +159,24 @@ pub fn instantiate(
         verify_mode,
         drand_pubkey,
         drand_chain_hash,
+        drand_genesis_time,
+        drand_period,
         authorized_submitters,
         min_claim_usaf: msg.min_claim_usaf.unwrap_or_default(),
+        reveal_timeout: msg
+            .reveal_timeout
+            .unwrap_or(DEFAULT_REVEAL_TIMEOUT_SECONDS),
+        open_code_registration: msg.open_code_registration.unwrap_or(false),
+        max_dry_rounds: msg.max_dry_rounds.unwrap_or_else(default_max_dry_rounds),
     };
     validate_randomness_config(&config)?;
     CONFIG.save(deps.storage, &config)?;
 
     // Zero the treasury balance.
     TREASURY.save(deps.storage, &Uint128::zero())?;
+
+    // No dry rounds yet ("Must Be Won" streak starts at 0).
+    DRY_STREAK.save(deps.storage, &0u64)?;
 
     // Open the first round (id 1).
     let round_id = 1u64;
@@ -189,6 +221,11 @@ pub fn execute(
             numbers,
             referral_code,
         } => execute_buy_tickets(deps, env, info, count, numbers, referral_code),
+        ExecuteMsg::GrantBonusTicket {
+            owner,
+            count,
+            numbers,
+        } => execute_grant_bonus_ticket(deps, env, info, owner, count, numbers),
         ExecuteMsg::CloseRound {} => execute_close_round(deps, env, info),
         ExecuteMsg::SubmitRandomness {
             round_id,
@@ -198,11 +235,12 @@ pub fn execute(
         ExecuteMsg::CommitRandomness {
             round_id,
             commitment,
-        } => execute_commit_randomness(deps, info, round_id, commitment),
+        } => execute_commit_randomness(deps, env, info, round_id, commitment),
         ExecuteMsg::RevealRandomness { round_id, value } => {
-            execute_reveal_randomness(deps, info, round_id, value)
+            execute_reveal_randomness(deps, env, info, round_id, value)
         }
         ExecuteMsg::Draw { round_id } => execute_draw(deps, env, info, round_id),
+        ExecuteMsg::CancelRound { round_id } => execute_cancel_round(deps, env, info, round_id),
         ExecuteMsg::ClaimReward {
             round_id,
             ticket_id,
@@ -225,7 +263,12 @@ pub fn execute(
             verify_mode,
             drand_pubkey,
             drand_chain_hash,
+            drand_genesis_time,
+            drand_period,
             min_claim_usaf,
+            reveal_timeout,
+            open_code_registration,
+            max_dry_rounds,
             add_submitters,
             remove_submitters,
         } => execute_set_config(
@@ -241,7 +284,12 @@ pub fn execute(
                 verify_mode,
                 drand_pubkey,
                 drand_chain_hash,
+                drand_genesis_time,
+                drand_period,
                 min_claim_usaf,
+                reveal_timeout,
+                open_code_registration,
+                max_dry_rounds,
                 add_submitters,
                 remove_submitters,
             },
@@ -333,51 +381,22 @@ fn execute_buy_tickets(
         .checked_add(prize_cut)
         .map_err(ContractError::Overflow)?;
 
-    // Materialise each ticket. `numbers` configures the first ticket only.
-    let mut seq = TICKET_SEQ.load(deps.storage, round_id)?;
-    let mut first_id = String::new();
-    let mut last_id = String::new();
-
-    for i in 0..count {
-        let picks = if i == 0 {
-            match &numbers {
-                Some(nums) => validate_ticket_numbers(nums, &config)?,
-                None => quick_pick(&env, &info.sender, round_id, seq, &config),
-            }
-        } else {
-            quick_pick(&env, &info.sender, round_id, seq, &config)
-        };
-
-        let id = ticket_id(seq);
-        if i == 0 {
-            first_id = id.clone();
-        }
-        last_id = id.clone();
-
-        let ticket = Ticket {
-            owner: info.sender.clone(),
-            numbers: picks,
-            matches: 0,
-            prize: Uint128::zero(),
-            claimed: false,
-        };
-        TICKETS.save(deps.storage, (round_id, id.as_str()), &ticket)?;
-        seq += 1;
-    }
-
-    // Distinct player accounting (idempotent presence set).
-    let mut new_player = false;
-    if PLAYERS
-        .may_load(deps.storage, (round_id, &info.sender))?
-        .is_none()
-    {
-        PLAYERS.save(deps.storage, (round_id, &info.sender), &1u8)?;
-        round.player_count = round.player_count.saturating_add(1);
-        new_player = true;
-    }
-
-    round.ticket_count = round.ticket_count.saturating_add(count as u64);
-    TICKET_SEQ.save(deps.storage, round_id, &seq)?;
+    // Materialise each ticket. `numbers` configures the first ticket only;
+    // remaining tickets (and all when omitted) are quick-picked. Shared with the
+    // bonus-ticket grant path via `mint_tickets` (which handles id allocation,
+    // entropy folding, ticket storage, player and ticket-count accounting).
+    let minted = mint_tickets(
+        deps.storage,
+        &env,
+        &config,
+        &mut round,
+        round_id,
+        &info.sender,
+        count,
+        numbers.as_deref(),
+        false, // paid ticket
+    )?;
+    let (first_id, last_id, new_player) = (minted.first_id, minted.last_id, minted.new_player);
     ROUNDS.save(deps.storage, round_id, &round)?;
 
     let event = Event::new("winsaf/buy")
@@ -408,9 +427,213 @@ fn execute_buy_tickets(
     Ok(Response::new().add_event(event))
 }
 
+/// Outcome of materialising a batch of tickets into a round.
+struct MintOutcome {
+    /// Id of the first minted ticket.
+    first_id: String,
+    /// Id of the last minted ticket.
+    last_id: String,
+    /// Whether `owner` was newly counted as a player in this round.
+    new_player: bool,
+}
+
+/// Materialise `count` tickets owned by `owner` into `round` (in-memory) and
+/// storage. Shared by the paid `BuyTickets` path and the operator-sponsored
+/// `GrantBonusTicket` path so the two mint tickets identically:
+///
+/// - `numbers` (when `Some`) configures the FIRST ticket only; remaining tickets
+///   (and all tickets when `None`) are quick-picked — exactly as `BuyTickets`.
+/// - each ticket is folded into the round's ticket-entropy accumulator,
+/// - ticket ids are the zero-padded per-round sequence,
+/// - `owner` is counted once in the distinct-player presence set,
+/// - `round.ticket_count`, `round.ticket_entropy` and `TICKET_SEQ` are updated.
+///
+/// Pool accounting stays with the caller (buy splits the payment; grant adds the
+/// full sponsored price), and the caller persists `round` after any further
+/// mutations. `free` flags the tickets as operator-granted bonus tickets.
+#[allow(clippy::too_many_arguments)]
+fn mint_tickets(
+    storage: &mut dyn cosmwasm_std::Storage,
+    env: &Env,
+    config: &Config,
+    round: &mut Round,
+    round_id: u64,
+    owner: &Addr,
+    count: u32,
+    numbers: Option<&[u8]>,
+    free: bool,
+) -> Result<MintOutcome, ContractError> {
+    let mut seq = TICKET_SEQ.load(storage, round_id)?;
+    let mut first_id = String::new();
+    let mut last_id = String::new();
+    // Running ticket-entropy accumulator (defense-in-depth for commit-reveal).
+    let mut entropy = round.ticket_entropy;
+
+    for i in 0..count {
+        let picks = if i == 0 {
+            match numbers {
+                Some(nums) => validate_ticket_numbers(nums, config)?,
+                None => quick_pick(env, owner, round_id, seq, config),
+            }
+        } else {
+            quick_pick(env, owner, round_id, seq, config)
+        };
+
+        let id = ticket_id(seq);
+        if i == 0 {
+            first_id = id.clone();
+        }
+        last_id = id.clone();
+
+        // Fold this ticket into the per-round entropy accumulator:
+        // entropy = sha256(entropy || owner || ticket_id || picks). The final
+        // value is unknown until the round closes, so a commit-reveal submitter
+        // cannot grind it while committing during the Open phase.
+        entropy = fold_ticket_entropy(&entropy, owner, &id, &picks);
+
+        let ticket = Ticket {
+            owner: owner.clone(),
+            numbers: picks,
+            matches: 0,
+            prize: Uint128::zero(),
+            claimed: false,
+            free,
+        };
+        TICKETS.save(storage, (round_id, id.as_str()), &ticket)?;
+        seq += 1;
+    }
+    round.ticket_entropy = entropy;
+
+    // Distinct player accounting (idempotent presence set).
+    let mut new_player = false;
+    if PLAYERS.may_load(storage, (round_id, owner))?.is_none() {
+        PLAYERS.save(storage, (round_id, owner), &1u8)?;
+        round.player_count = round.player_count.saturating_add(1);
+        new_player = true;
+    }
+
+    round.ticket_count = round.ticket_count.saturating_add(count as u64);
+    TICKET_SEQ.save(storage, round_id, &seq)?;
+
+    Ok(MintOutcome {
+        first_id,
+        last_id,
+        new_player,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Grant bonus ticket (operator-sponsored, off-chain "redeem XP for a free ticket")
+// ---------------------------------------------------------------------------
+
+/// Mint `count` operator-sponsored bonus tickets OWNED BY `owner`, flagged
+/// `free`, into the current open round. Backs an off-chain "redeem XP for a free
+/// ticket" feature: the caller (admin or an authorized submitter) attaches the
+/// full `count * ticket_price` so the pool stays honest — the granted tickets are
+/// fully funded and can win / be claimed by `owner` exactly like paid tickets.
+///
+/// Unlike a paid buy, the ENTIRE attached amount goes to the round pool (no
+/// treasury/referral split): the operator sponsors the prize contribution
+/// directly so the user pays nothing and the pool is never diluted.
+fn execute_grant_bonus_ticket(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    owner: String,
+    count: u32,
+    numbers: Option<Vec<u8>>,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+
+    // Authorization: admin or an authorized submitter, exactly like the check
+    // `SubmitRandomness` uses.
+    if !config.is_submitter(&info.sender) {
+        return Err(ContractError::UnauthorizedSubmitter);
+    }
+
+    if count == 0 || count > MAX_TICKETS_PER_TX {
+        return Err(ContractError::InvalidTicketCount {
+            count,
+            max: MAX_TICKETS_PER_TX,
+        });
+    }
+
+    // Validate / normalize the beneficiary address, like other addr params.
+    let owner_addr = deps.api.addr_validate(&owner)?;
+
+    // Honesty funding: require exactly `count * ticket_price` usaf attached — the
+    // same guard a paid buy of `count` tickets uses — and add ALL of it to the
+    // pool so the bonus ticket is fully funded.
+    let unit = config.ticket_price.amount;
+    let total = unit
+        .checked_mul(Uint128::from(count))
+        .map_err(ContractError::Overflow)?;
+    assert_exact_usaf(&info.funds, total)?;
+
+    let round_id = CURRENT_ROUND.load(deps.storage)?;
+    let mut round = ROUNDS
+        .load(deps.storage, round_id)
+        .map_err(|_| ContractError::RoundNotFound { round_id })?;
+    if !round.status.accepts_tickets() {
+        return Err(ContractError::RoundNotOpen {
+            round_id,
+            status: status_str(&round.status),
+        });
+    }
+
+    // Sponsored funds grow this round's pool in full.
+    round.pool = round
+        .pool
+        .checked_add(total)
+        .map_err(ContractError::Overflow)?;
+
+    // Mint the tickets owned by `owner`, flagged free.
+    let minted = mint_tickets(
+        deps.storage,
+        &env,
+        &config,
+        &mut round,
+        round_id,
+        &owner_addr,
+        count,
+        numbers.as_deref(),
+        true, // free bonus ticket
+    )?;
+    ROUNDS.save(deps.storage, round_id, &round)?;
+
+    let event = Event::new("winsaf/grant_bonus_ticket")
+        .add_attribute("round_id", round_id.to_string())
+        .add_attribute("granted_by", info.sender.to_string())
+        .add_attribute("owner", owner_addr.to_string())
+        .add_attribute("count", count.to_string())
+        .add_attribute("sponsored", total)
+        .add_attribute("pool", round.pool)
+        .add_attribute("first_ticket_id", minted.first_id)
+        .add_attribute("last_ticket_id", minted.last_id)
+        .add_attribute("new_player", minted.new_player.to_string());
+
+    Ok(Response::new().add_event(event))
+}
+
 // ---------------------------------------------------------------------------
 // Close
 // ---------------------------------------------------------------------------
+
+/// The first drand beacon round published strictly AFTER `close_time`. drand
+/// round `R` is published at `genesis + (R-1) * period`, so this returns the
+/// smallest `R` whose publish time is `> close_time`. Binding a WinSaf round to
+/// a beacon that does not yet exist at close is what makes the draw unpredictable
+/// and un-grindable by whoever relays it.
+fn drand_round_after(close_time: u64, genesis: u64, period: u64) -> u64 {
+    if period == 0 || close_time < genesis {
+        // Defensive fallback (config validation rejects drand mode with a zero
+        // period; clock skew before genesis cannot happen for a live round).
+        return 1;
+    }
+    // publish(R) = genesis + (R-1)*period > close_time
+    //   => R = floor((close_time - genesis) / period) + 2
+    (close_time - genesis) / period + 2
+}
 
 fn execute_close_round(
     deps: DepsMut,
@@ -443,14 +666,30 @@ fn execute_close_round(
     round.status = RoundStatus::Drawing;
     ROUNDS.save(deps.storage, round_id, &round)?;
 
+    // Bind the beacon this round will consume. In drand mode it is the FIRST
+    // drand round published strictly AFTER `closes_at` — so the beacon does not
+    // yet exist when tickets are bought or the round closes, and the submitter
+    // cannot grind it. In mock/commit-reveal modes there is no external beacon,
+    // so we keep `round_id` as an inert placeholder.
+    let config = CONFIG.load(deps.storage)?;
+    let beacon_round = match config.randomness_mode {
+        RandomnessMode::Drand => {
+            drand_round_after(round.closes_at, config.drand_genesis_time, config.drand_period)
+        }
+        _ => round_id,
+    };
+
     // Create the pending randomness slot for this round so submitters can act.
     let request = RandomnessRequest {
         round_id,
-        beacon_round: round_id,
+        beacon_round,
         status: RandomnessStatus::Pending,
         commitment: None,
         randomness: None,
         signature: None,
+        committer: None,
+        commit_height: None,
+        reveal_deadline: None,
     };
     RANDOMNESS.save(deps.storage, round_id, &request)?;
 
@@ -527,6 +766,7 @@ fn execute_submit_randomness(
 
 fn execute_commit_randomness(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     round_id: u64,
     commitment: HexBinary,
@@ -548,20 +788,40 @@ fn execute_commit_randomness(
     }
 
     let mut request = load_pending_randomness(deps.as_ref(), round_id)?;
+    // Bind the commitment to its committer and record the commit height/time so
+    // (a) only the same submitter may reveal, (b) the reveal is forced to a
+    // strictly later block, and (c) a never-revealed commitment can be recovered
+    // via CancelRound after `reveal_deadline`.
+    // A zero timeout (e.g. after a migration that defaulted the field) falls back
+    // to the sane default so a never-revealed round isn't instantly cancellable.
+    let timeout = if config.reveal_timeout == 0 {
+        DEFAULT_REVEAL_TIMEOUT_SECONDS
+    } else {
+        config.reveal_timeout
+    };
     request.commitment = Some(commitment.clone());
     request.status = RandomnessStatus::Committed;
+    request.committer = Some(info.sender.clone());
+    request.commit_height = Some(env.block.height);
+    request.reveal_deadline = Some(env.block.time.seconds().saturating_add(timeout));
     RANDOMNESS.save(deps.storage, round_id, &request)?;
 
     Ok(Response::new().add_event(
         Event::new("winsaf/commit_randomness")
             .add_attribute("round_id", round_id.to_string())
             .add_attribute("committer", info.sender)
+            .add_attribute("commit_height", env.block.height.to_string())
+            .add_attribute(
+                "reveal_deadline",
+                request.reveal_deadline.unwrap_or_default().to_string(),
+            )
             .add_attribute("commitment", commitment.to_hex()),
     ))
 }
 
 fn execute_reveal_randomness(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     round_id: u64,
     value: HexBinary,
@@ -588,12 +848,50 @@ fn execute_reveal_randomness(
         .clone()
         .ok_or(ContractError::NoCommitment { round_id })?;
 
+    // Bind the reveal to the committer: only the address that posted the
+    // commitment may reveal it (HIGH #7). Falls back to the submitter check
+    // above for legacy requests with no recorded committer.
+    if let Some(committer) = &request.committer {
+        if committer != &info.sender {
+            return Err(ContractError::NotCommitter { round_id });
+        }
+    }
+
+    // Enforce the minimum reveal-delay window: the reveal must land at a
+    // strictly-later block than the commit (CRITICAL #1c). The reveal block's
+    // height/time are mixed into the seed below and are unknown at commit time,
+    // so the outcome cannot be precomputed when the commitment is posted.
+    if let Some(commit_height) = request.commit_height {
+        let min_height = commit_height.saturating_add(MIN_REVEAL_DELAY_BLOCKS);
+        if env.block.height < min_height {
+            return Err(ContractError::RevealTooEarly {
+                round_id,
+                commit_height,
+                min_height,
+            });
+        }
+    }
+
     // Reveal must match the earlier commitment.
     verify_reveal(&commitment, &value)?;
 
-    // The randomness a draw consumes is sha256(value): a fixed-length,
-    // uniformly-distributed 32-byte seed regardless of the reveal's own length.
-    let randomness = HexBinary::from(sha256(value.as_slice()));
+    // Defense-in-depth seed derivation (CRITICAL #1b). The consumed seed is NOT
+    // just sha256(value) — it also folds in inputs the submitter did not control
+    // when committing:
+    //   randomness = sha256( value
+    //                      || round.ticket_entropy      (fixed at close, unknown at commit)
+    //                      || reveal block time (be)     (unknown at commit)
+    //                      || reveal block height (be) ) (unknown at commit)
+    // so grinding `value` offline can no longer steer the draw outcome.
+    let round = ROUNDS
+        .load(deps.storage, round_id)
+        .map_err(|_| ContractError::RoundNotFound { round_id })?;
+    let mut preimage: Vec<u8> = Vec::with_capacity(value.len() + 32 + 8 + 8);
+    preimage.extend_from_slice(value.as_slice());
+    preimage.extend_from_slice(&round.ticket_entropy);
+    preimage.extend_from_slice(&env.block.time.seconds().to_be_bytes());
+    preimage.extend_from_slice(&env.block.height.to_be_bytes());
+    let randomness = HexBinary::from(sha256(&preimage));
 
     request.status = RandomnessStatus::Fulfilled;
     request.randomness = Some(randomness.clone());
@@ -668,7 +966,61 @@ fn execute_draw(
     }
 
     // Fix per-tier per-winner payouts from the pool.
-    let tiers = compute_prize_tiers(round.pool, &counts);
+    let mut tiers = compute_prize_tiers(round.pool, &counts);
+
+    // --- "Must Be Won" forced rolldown ------------------------------------
+    // The jackpot pool must never roll over more than `max_dry_rounds`
+    // consecutive dry rounds (no match-6 winner). On the round that would push
+    // the streak to the cap, we FORCE the tier-6 (jackpot) allocation to roll
+    // DOWN to the best-matching lower tier present, guaranteeing distribution.
+    let jackpot_won = counts.six > 0;
+    let dry_streak = DRY_STREAK.may_load(deps.storage)?.unwrap_or(0);
+    // Would settling this round WITHOUT a jackpot winner reach the cap?
+    let force =
+        !jackpot_won && config.max_dry_rounds > 0 && (dry_streak + 1) >= config.max_dry_rounds;
+
+    let mut forced_paid = false;
+    let mut boost_tier: u8 = 0;
+    let mut rolldown_amount = Uint128::zero();
+    if force {
+        // Pick the best present lower tier in order [5, 4, 3].
+        if let Some(b) = [5u8, 4u8, 3u8]
+            .into_iter()
+            .find(|t| counts.for_tier(*t) > 0)
+        {
+            // The jackpot (tier-6) allocation that would otherwise roll over.
+            // Same checked math as `compute_prize_tiers` (guard div-by-zero).
+            let jackpot_alloc = match round.pool.checked_mul(Uint128::from(TIER6_BPS)) {
+                Ok(scaled) => scaled
+                    .checked_div(Uint128::from(10_000u128))
+                    .unwrap_or_default(),
+                Err(_) => Uint128::zero(),
+            };
+            let winners = counts.for_tier(b);
+            // Redistribute the jackpot allocation equally among tier-b winners.
+            // Any integer remainder/dust (jackpot_alloc % winners) is NOT added
+            // to any per-winner payout, so it stays in `leftover` and
+            // rolls/sweeps as today — every usaf remains accounted for.
+            let per_winner = jackpot_alloc
+                .checked_div(Uint128::from(winners))
+                .unwrap_or_default();
+            if !per_winner.is_zero() {
+                tiers.boost_tier(b, per_winner);
+                forced_paid = true;
+                boost_tier = b;
+                // Amount actually redistributed to winners (excludes the dust
+                // remainder, which rolls/sweeps unchanged).
+                rolldown_amount = per_winner
+                    .checked_mul(Uint128::from(winners))
+                    .unwrap_or_default();
+            }
+        }
+        // Edge case: if NO lower tier has any winner (no ticket matched >= 3),
+        // we cannot force a payout from nothing. `forced_paid` stays false, the
+        // jackpot allocation rolls over as usual, and the streak persists. The
+        // "Must Be Won" guarantee therefore holds whenever the forced round has
+        // any ticket matching >= 3 — which is the only case a payout is possible.
+    }
 
     // Pass 2: assign each ticket its prize and mark winners.
     let mut winning_tickets: u64 = 0;
@@ -710,42 +1062,52 @@ fn execute_draw(
     round.winning_tickets = winning_tickets;
     round.status = RoundStatus::Settled;
 
-    // Rollover: if no jackpot winner (tier_6) and rollover is enabled, the
-    // leftover (unassigned) pool moves into the next round. Assigned prizes stay
-    // in this round to back pull-based claims.
-    let no_jackpot = counts.six == 0;
-    let mut rollover_amount = Uint128::zero();
-    if config.rollover_on_no_winner && no_jackpot {
-        rollover_amount = leftover;
-    }
+    // Dust disposal (LOW #25): every usaf must be accounted. `distributed` backs
+    // this round's pull-claims; the remainder `leftover` (unassigned tier
+    // allocations for tiers with no winners + rounding dust) must go somewhere or
+    // it strands as untracked contract balance. Previously it only rolled over on
+    // a no-jackpot round with rollover enabled — on a jackpot win (or with
+    // rollover disabled) it leaked and quietly accumulated. We now dispose of the
+    // FULL leftover in every branch:
+    //   - roll it into the next round when rollover is enabled (player-favourable,
+    //     keeps funds in the prize system), OR
+    //   - sweep it to the treasury when rollover is disabled, so WithdrawTreasury
+    //     can reconcile it.
+    // By construction `distributed + leftover == round.pool` (pre-draw), so
+    // either disposition keeps every usaf accounted for.
+    let rollover_amount = if config.rollover_on_no_winner {
+        leftover
+    } else {
+        if !leftover.is_zero() {
+            TREASURY.update(deps.storage, |t| -> Result<_, ContractError> {
+                Ok(t.checked_add(leftover)?)
+            })?;
+        }
+        Uint128::zero()
+    };
     // The pool retained on this round is exactly what claims can draw down.
     round.pool = distributed;
     ROUNDS.save(deps.storage, round_id, &round)?;
 
-    // Open the next round (id + 1) seeded with any rollover.
-    let next_id = round_id
-        .checked_add(1)
-        .ok_or_else(|| ContractError::InvalidConfig {
-            reason: "round id overflow".to_string(),
-        })?;
-    let opens_at = env.block.time.seconds();
-    let closes_at =
-        opens_at
-            .checked_add(config.draw_interval)
-            .ok_or_else(|| ContractError::InvalidConfig {
-                reason: "draw_interval overflows round close time".to_string(),
-            })?;
-    let rolled_from = if rollover_amount.is_zero() {
-        None
+    // Update the "Must Be Won" dry streak: reset to 0 when the jackpot was won
+    // (naturally) or forced down to a lower tier; otherwise it grew by one.
+    let new_dry_streak = if jackpot_won || forced_paid {
+        0
     } else {
-        Some(round_id)
+        dry_streak + 1
     };
-    let next_round = Round::new_open(next_id, opens_at, closes_at, rollover_amount, rolled_from);
-    ROUNDS.save(deps.storage, next_id, &next_round)?;
-    TICKET_SEQ.save(deps.storage, next_id, &0u64)?;
-    CURRENT_ROUND.save(deps.storage, &next_id)?;
+    DRY_STREAK.save(deps.storage, &new_dry_streak)?;
 
-    let event = Event::new("winsaf/draw")
+    // Open the next round (id + 1) seeded with any rollover.
+    let next_id = open_next_round(
+        deps.storage,
+        round_id,
+        &config,
+        env.block.time.seconds(),
+        rollover_amount,
+    )?;
+
+    let mut event = Event::new("winsaf/draw")
         .add_attribute("round_id", round_id.to_string())
         .add_attribute("winning_numbers", numbers_csv(&winning))
         .add_attribute("winners_3", counts.three.to_string())
@@ -754,6 +1116,177 @@ fn execute_draw(
         .add_attribute("winners_6", counts.six.to_string())
         .add_attribute("distributed", distributed)
         .add_attribute("rollover", rollover_amount)
+        .add_attribute("dry_streak", new_dry_streak.to_string())
+        .add_attribute("rolldown", forced_paid.to_string())
+        .add_attribute("next_round_id", next_id.to_string());
+    if forced_paid {
+        event = event
+            .add_attribute("rolldown_tier", boost_tier.to_string())
+            .add_attribute("rolldown_amount", rolldown_amount);
+    }
+
+    Ok(Response::new().add_event(event))
+}
+
+/// Open the round following `prev_id`, seeded with `rollover_amount`, and make it
+/// the current round. Shared by `execute_draw` (settle) and `execute_cancel_round`
+/// (recovery) so the lifecycle always advances and never permanently halts.
+/// Returns the new round id.
+fn open_next_round(
+    storage: &mut dyn cosmwasm_std::Storage,
+    prev_id: u64,
+    config: &Config,
+    now: u64,
+    rollover_amount: Uint128,
+) -> Result<u64, ContractError> {
+    let next_id = prev_id
+        .checked_add(1)
+        .ok_or_else(|| ContractError::InvalidConfig {
+            reason: "round id overflow".to_string(),
+        })?;
+    let closes_at = now
+        .checked_add(config.draw_interval)
+        .ok_or_else(|| ContractError::InvalidConfig {
+            reason: "draw_interval overflows round close time".to_string(),
+        })?;
+    let rolled_from = if rollover_amount.is_zero() {
+        None
+    } else {
+        Some(prev_id)
+    };
+    let next_round = Round::new_open(next_id, now, closes_at, rollover_amount, rolled_from);
+    ROUNDS.save(storage, next_id, &next_round)?;
+    TICKET_SEQ.save(storage, next_id, &0u64)?;
+    CURRENT_ROUND.save(storage, &next_id)?;
+    Ok(next_id)
+}
+
+// ---------------------------------------------------------------------------
+// Cancel (recovery) — MEDIUM #15 / HIGH #7
+// ---------------------------------------------------------------------------
+
+/// Recover a `Drawing` round whose randomness never fulfilled, so buyer funds are
+/// never trapped and the protocol never halts on an unfulfillable round.
+///
+/// Authorization / timing:
+///   - the admin may cancel a stuck `Drawing` round at any time, OR
+///   - anyone may cancel once EITHER the commit-reveal `reveal_deadline` has
+///     passed OR `closes_at + CANCEL_GRACE_SECONDS` has elapsed.
+/// A round whose randomness is already `Fulfilled` must be drawn, not cancelled.
+///
+/// Effect:
+///   - marks the round `Cancelled`,
+///   - converts the retained `pool` into a pro-rata pull-refund per ticket
+///     (assigned to `Ticket.prize`, claimed via `ClaimReward`, double-refund
+///     guarded by `Ticket.claimed`) — capped at funds actually held so no
+///     underflow can occur, and
+///   - opens the next round (carrying any un-refundable rounding dust as
+///     rollover) so `CURRENT_ROUND` advances and sales resume.
+fn execute_cancel_round(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    round_id: u64,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    let mut round = ROUNDS
+        .load(deps.storage, round_id)
+        .map_err(|_| ContractError::RoundNotFound { round_id })?;
+
+    // Only a stuck round awaiting randomness can be cancelled.
+    if round.status != RoundStatus::Drawing {
+        return Err(ContractError::CannotCancel {
+            round_id,
+            reason: format!("round is {}, not drawing", status_str(&round.status)),
+        });
+    }
+
+    // If randomness is already fulfilled the round must be drawn, not cancelled.
+    let request = RANDOMNESS.may_load(deps.storage, round_id)?;
+    if let Some(req) = &request {
+        if matches!(req.status, RandomnessStatus::Fulfilled) {
+            return Err(ContractError::CannotCancel {
+                round_id,
+                reason: "randomness already fulfilled — draw it instead".to_string(),
+            });
+        }
+    }
+
+    // Authorization: admin any time; otherwise a timeout must have passed.
+    let now = env.block.time.seconds();
+    let is_admin = config.is_admin(&info.sender);
+    if !is_admin {
+        let reveal_deadline_passed = request
+            .as_ref()
+            .and_then(|r| r.reveal_deadline)
+            .map(|d| now > d)
+            .unwrap_or(false);
+        let grace_passed = now >= round.closes_at.saturating_add(CANCEL_GRACE_SECONDS);
+        if !reveal_deadline_passed && !grace_passed {
+            return Err(ContractError::CannotCancel {
+                round_id,
+                reason: "not admin and recovery timeout has not elapsed".to_string(),
+            });
+        }
+    }
+
+    // Trustless pro-rata refund: only the prize cut reached `round.pool`
+    // (treasury/referral already left it), so we can only repay from what is
+    // held. Distribute the retained pool evenly across tickets, floor-divided;
+    // this caps total refunds at `pool` so `PoolUnderflow` can never trigger. Any
+    // rounding dust rolls to the next round.
+    let ticket_count = round.ticket_count;
+    let pool = round.pool;
+    let per_ticket = if ticket_count == 0 {
+        Uint128::zero()
+    } else {
+        pool.checked_div(Uint128::from(ticket_count))
+            .unwrap_or_default()
+    };
+
+    let mut assigned = Uint128::zero();
+    if !per_ticket.is_zero() {
+        let ids: Vec<String> = TICKETS
+            .prefix(round_id)
+            .keys(deps.storage, None, None, Order::Ascending)
+            .collect::<StdResult<_>>()?;
+        for id in &ids {
+            TICKETS.update(
+                deps.storage,
+                (round_id, id.as_str()),
+                |t| -> StdResult<_> {
+                    let mut t = t.expect("ticket exists (iterated above)");
+                    // Refund overrides any (non-existent) prize; not yet claimed.
+                    t.prize = per_ticket;
+                    t.matches = 0;
+                    t.claimed = false;
+                    Ok(t)
+                },
+            )?;
+            assigned = assigned
+                .checked_add(per_ticket)
+                .map_err(ContractError::Overflow)?;
+        }
+    }
+
+    // Dust that can't be refunded (rounding remainder) rolls into the next round.
+    let dust = pool.checked_sub(assigned).map_err(ContractError::Overflow)?;
+
+    round.status = RoundStatus::Cancelled;
+    // Retain exactly the assigned refunds on this round to back pull-claims.
+    round.pool = assigned;
+    ROUNDS.save(deps.storage, round_id, &round)?;
+
+    // CRITICAL for liveness: advance the lifecycle so future rounds/sales resume.
+    let next_id = open_next_round(deps.storage, round_id, &config, now, dust)?;
+
+    let event = Event::new("winsaf/cancel")
+        .add_attribute("round_id", round_id.to_string())
+        .add_attribute("by", info.sender.to_string())
+        .add_attribute("admin", is_admin.to_string())
+        .add_attribute("refund_per_ticket", per_ticket)
+        .add_attribute("refund_total", assigned)
+        .add_attribute("rollover_dust", dust)
         .add_attribute("next_round_id", next_id.to_string());
 
     Ok(Response::new().add_event(event))
@@ -885,6 +1418,7 @@ fn execute_register_code(
     info: MessageInfo,
     code: String,
 ) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
     validate_code(&code)?;
     let normalized = normalize_code(&code);
 
@@ -893,6 +1427,12 @@ fn execute_register_code(
         if existing != info.sender {
             return Err(ContractError::unauthorized("code owner"));
         }
+    } else if !config.open_code_registration && !config.is_admin(&info.sender) {
+        // Anti-squatting (LOW #26): when permissionless registration is off
+        // (default), only the admin may claim a NEW code, so reserved
+        // brand/influencer codes cannot be front-run. Owners may still
+        // re-register (idempotently) their existing codes above regardless.
+        return Err(ContractError::unauthorized("admin (code registration is closed)"));
     }
     REFERRAL_CODES.save(deps.storage, &normalized, &info.sender)?;
 
@@ -997,7 +1537,12 @@ struct SetConfigArgs {
     verify_mode: Option<VerifyMode>,
     drand_pubkey: Option<HexBinary>,
     drand_chain_hash: Option<String>,
+    drand_genesis_time: Option<u64>,
+    drand_period: Option<u64>,
     min_claim_usaf: Option<Uint128>,
+    reveal_timeout: Option<u64>,
+    open_code_registration: Option<bool>,
+    max_dry_rounds: Option<u64>,
     add_submitters: Option<Vec<String>>,
     remove_submitters: Option<Vec<String>>,
 }
@@ -1010,6 +1555,47 @@ fn execute_set_config(
     let mut config = CONFIG.load(deps.storage)?;
     if !config.is_admin(&info.sender) {
         return Err(ContractError::unauthorized("admin"));
+    }
+
+    // --- MEDIUM #16 guardrails ---------------------------------------------
+    // (1) Refuse security downgrades to Mock randomness / Dev verify unless this
+    //     wasm was compiled with the `dev-randomness` feature. The deployable
+    //     artifact is built WITHOUT it (scripts/optimize.sh), so a live/testnet
+    //     contract holding real funds can never be switched to attacker-chosen
+    //     randomness via SetConfig.
+    #[cfg(not(feature = "dev-randomness"))]
+    if matches!(args.randomness_mode, Some(RandomnessMode::Mock)) {
+        return Err(ContractError::InvalidConfig {
+            reason: "Mock randomness cannot be enabled in a production build".to_string(),
+        });
+    }
+    #[cfg(not(feature = "dev-randomness"))]
+    if matches!(args.verify_mode, Some(VerifyMode::Dev)) {
+        return Err(ContractError::InvalidConfig {
+            reason: "Dev verify mode cannot be enabled in a production build".to_string(),
+        });
+    }
+
+    // (2) Freeze fairness/economics-affecting config while a round is in flight
+    //     (Open or Drawing) so tickets sold under the old economics/randomness
+    //     are never re-priced or re-randomized mid-round. These changes apply
+    //     from the NEXT round only. Admin/rollover/min_claim/submitter/timeout
+    //     edits stay allowed mid-round.
+    let round_id = CURRENT_ROUND.load(deps.storage)?;
+    let status = ROUNDS.load(deps.storage, round_id)?.status;
+    let in_flight = matches!(status, RoundStatus::Open | RoundStatus::Drawing);
+    if in_flight
+        && (args.randomness_mode.is_some()
+            || args.verify_mode.is_some()
+            || args.ticket_price.is_some()
+            || args.split.is_some()
+            || args.drand_pubkey.is_some()
+            || args.drand_chain_hash.is_some())
+    {
+        return Err(ContractError::InvalidConfig {
+            reason: "randomness/verify/price/split changes are only allowed between rounds"
+                .to_string(),
+        });
     }
 
     let mut changed: Vec<Attribute> = Vec::new();
@@ -1077,9 +1663,29 @@ fn execute_set_config(
         config.drand_chain_hash = ch;
         changed.push(Attribute::new("drand_chain_hash", "updated"));
     }
+    if let Some(g) = args.drand_genesis_time {
+        config.drand_genesis_time = g;
+        changed.push(Attribute::new("drand_genesis_time", g.to_string()));
+    }
+    if let Some(p) = args.drand_period {
+        config.drand_period = p;
+        changed.push(Attribute::new("drand_period", p.to_string()));
+    }
     if let Some(v) = args.min_claim_usaf {
         config.min_claim_usaf = v;
         changed.push(Attribute::new("min_claim_usaf", v));
+    }
+    if let Some(t) = args.reveal_timeout {
+        config.reveal_timeout = t;
+        changed.push(Attribute::new("reveal_timeout", t.to_string()));
+    }
+    if let Some(o) = args.open_code_registration {
+        config.open_code_registration = o;
+        changed.push(Attribute::new("open_code_registration", o.to_string()));
+    }
+    if let Some(mdr) = args.max_dry_rounds {
+        config.max_dry_rounds = mdr;
+        changed.push(Attribute::new("max_dry_rounds", mdr.to_string()));
     }
     if let Some(add) = args.add_submitters {
         for a in add {
@@ -1162,6 +1768,7 @@ fn query_round(deps: Deps, round_id: u64) -> Result<RoundResponse, ContractError
         .load(deps.storage, round_id)
         .map_err(|_| ContractError::RoundNotFound { round_id })?;
     let randomness = RANDOMNESS.may_load(deps.storage, round_id)?;
+    let dry_streak = DRY_STREAK.may_load(deps.storage)?.unwrap_or(0);
     Ok(RoundResponse {
         id: r.id,
         status: r.status,
@@ -1175,6 +1782,7 @@ fn query_round(deps: Deps, round_id: u64) -> Result<RoundResponse, ContractError
         rolled_over_from: r.rolled_over_from,
         winning_tickets: r.winning_tickets,
         randomness,
+        dry_streak,
     })
 }
 
@@ -1296,7 +1904,16 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
             found: current.contract,
         });
     }
-    // Idempotent version bump; add data migrations here on future versions.
+    // Idempotent version bump. The security-hardening upgrade added fields to
+    // Config / Round / RandomnessRequest; all are `#[serde(default)]` so existing
+    // persisted state deserializes without an explicit data migration (defaults:
+    // reveal_timeout=0, open_code_registration=false, ticket_entropy=zero,
+    // committer/commit_height/reveal_deadline=None). The "Must Be Won" rolldown
+    // upgrade added `Config.max_dry_rounds` (serde default 5) and the
+    // `DRY_STREAK` item (absent → treated as 0 via `.may_load()?.unwrap_or(0)`),
+    // so both migrate without an explicit data step. The admin should `SetConfig`
+    // a non-zero `reveal_timeout` post-migration. Add data migrations here on
+    // future versions as needed.
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     Ok(Response::new().add_event(
         Event::new("winsaf/migrate")
@@ -1360,12 +1977,19 @@ fn validate_randomness_config(config: &Config) -> Result<(), ContractError> {
                 reason: "drand_chain_hash is required in drand mode".to_string(),
             });
         }
+        // The beacon round a round consumes is derived from `closes_at` using the
+        // genesis/period, so both must be set for the future-round binding to work.
+        if config.drand_period == 0 || config.drand_genesis_time == 0 {
+            return Err(ContractError::InvalidConfig {
+                reason: "drand mode requires non-zero drand_genesis_time and drand_period".to_string(),
+            });
+        }
         if matches!(config.verify_mode, VerifyMode::Bls)
-            && config.drand_pubkey.len() != G1_LEN
+            && config.drand_pubkey.len() != G2_LEN
         {
             return Err(ContractError::InvalidPubkey {
                 reason: format!(
-                    "drand mode with BLS verification requires a {G1_LEN}-byte G1 public key"
+                    "drand mode with BLS verification requires a {G2_LEN}-byte G2 public key"
                 ),
             });
         }
@@ -1451,6 +2075,21 @@ fn quick_pick(env: &Env, sender: &Addr, round_id: u64, seq: u64, config: &Config
     mix(&env.block.time.nanos().to_be_bytes());
 
     pick_distinct(seed, config.numbers_per_ticket, config.number_max)
+}
+
+/// Fold one ticket into a round's ticket-entropy accumulator (CRITICAL #1a).
+///
+/// `new = sha256(prev || buyer_bytes || ticket_id_bytes || picks)`. Chaining the
+/// previous accumulator makes the result depend on the full ordered ticket set,
+/// which is not known when a commit-reveal submitter must post their commitment
+/// during the `Open` phase — so it cannot be ground offline to steer the draw.
+fn fold_ticket_entropy(prev: &[u8; 32], buyer: &Addr, ticket_id: &str, picks: &[u8]) -> [u8; 32] {
+    let mut buf: Vec<u8> = Vec::with_capacity(32 + buyer.as_bytes().len() + ticket_id.len() + picks.len());
+    buf.extend_from_slice(prev);
+    buf.extend_from_slice(buyer.as_bytes());
+    buf.extend_from_slice(ticket_id.as_bytes());
+    buf.extend_from_slice(picks);
+    sha256(&buf)
 }
 
 /// Derive the winning numbers from verified randomness: `count` distinct values
@@ -1630,6 +2269,17 @@ impl TierCounts {
             _ => {}
         }
     }
+
+    /// Winner count for an exact tier (3/4/5/6); 0 for any other tier.
+    fn for_tier(&self, tier: u8) -> u64 {
+        match tier {
+            3 => self.three,
+            4 => self.four,
+            5 => self.five,
+            6 => self.six,
+            _ => 0,
+        }
+    }
 }
 
 impl PrizeTiers {
@@ -1641,6 +2291,18 @@ impl PrizeTiers {
             5 => self.tier_5,
             m if m >= 6 => self.tier_6,
             _ => Uint128::zero(),
+        }
+    }
+
+    /// Add `add` to the per-winner payout of an exact tier (3/4/5). Used by the
+    /// "Must Be Won" forced rolldown to boost the best present lower tier with
+    /// the jackpot allocation. Tier 6 (the jackpot itself) is never boosted here.
+    fn boost_tier(&mut self, tier: u8, add: Uint128) {
+        match tier {
+            3 => self.tier_3 = self.tier_3.saturating_add(add),
+            4 => self.tier_4 = self.tier_4.saturating_add(add),
+            5 => self.tier_5 = self.tier_5.saturating_add(add),
+            _ => {}
         }
     }
 }
@@ -1721,8 +2383,13 @@ mod tests {
             verify_mode: None,     // Dev
             drand_pubkey: None,
             drand_chain_hash: None,
+            drand_genesis_time: None,
+            drand_period: None,
             authorized_submitters: vec![submitter.to_string()],
             min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: None,
         };
         let info = message_info(&admin, &[]);
         instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
@@ -1857,8 +2524,13 @@ mod tests {
             verify_mode: None,
             drand_pubkey: None,
             drand_chain_hash: None,
+            drand_genesis_time: None,
+            drand_period: None,
             authorized_submitters: vec![],
             min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: None,
         };
         instantiate(deps.as_mut(), mock_env(), message_info(&sender, &[]), msg).unwrap();
         let c: Config =
@@ -1884,8 +2556,13 @@ mod tests {
             verify_mode: None,
             drand_pubkey: None,
             drand_chain_hash: None,
+            drand_genesis_time: None,
+            drand_period: None,
             authorized_submitters: vec![],
             min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: None,
         };
         let err = instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
             .unwrap_err();
@@ -1909,8 +2586,13 @@ mod tests {
             verify_mode: None,
             drand_pubkey: None,
             drand_chain_hash: None,
+            drand_genesis_time: None,
+            drand_period: None,
             authorized_submitters: vec![],
             min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: None,
         };
         let err = instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
             .unwrap_err();
@@ -1933,10 +2615,15 @@ mod tests {
             rollover_on_no_winner: None,
             randomness_mode: Some(RandomnessMode::Drand),
             verify_mode: Some(VerifyMode::Bls),
-            drand_pubkey: Some(HexBinary::from(vec![1u8; G1_LEN])),
+            drand_pubkey: Some(HexBinary::from(vec![1u8; G2_LEN])),
             drand_chain_hash: None,
+            drand_genesis_time: None,
+            drand_period: None,
             authorized_submitters: vec![],
             min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: None,
         };
         let err = instantiate(
             deps.as_mut(),
@@ -1961,8 +2648,13 @@ mod tests {
             verify_mode: Some(VerifyMode::Bls),
             drand_pubkey: Some(HexBinary::from(vec![1u8; 10])),
             drand_chain_hash: Some("abcd".to_string()),
+            drand_genesis_time: None,
+            drand_period: None,
             authorized_submitters: vec![],
             min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: None,
         };
         let err = instantiate(
             deps.as_mut(),
@@ -2047,9 +2739,13 @@ mod tests {
 
     #[test]
     fn buy_by_code_binds_and_credits() {
-        let (mut deps, api, env, _admin, _sub) = setup();
+        let (mut deps, api, env, admin, _sub) = setup();
         let buyer = mk(&api, "buyer");
         let referrer = mk(&api, "referrer");
+
+        // Enable permissionless code registration so a non-admin referrer may
+        // self-register (default is admin-only to prevent squatting, LOW #26).
+        open_code_registration(&mut deps, &env, &admin);
 
         // referrer registers a code
         execute(
@@ -2062,7 +2758,7 @@ mod tests {
         )
         .unwrap();
 
-        // buyer buys with the code (case-insensitive) — should credit referrer.
+        // buyer buys with the code (case-insensitive); should credit referrer.
         buy(&mut deps, &env, &buyer, 1, None, Some("winbig".to_string())).unwrap();
 
         let summary: ReferralSummaryResponse = from_json(
@@ -2491,8 +3187,13 @@ mod tests {
                 verify_mode: Some(VerifyMode::Dev),
                 drand_pubkey: None,
                 drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
                 authorized_submitters: vec![submitter.to_string()],
                 min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
             },
         )
         .unwrap();
@@ -2535,10 +3236,29 @@ mod tests {
         )
         .unwrap();
 
-        // Wrong reveal.
+        // Reveal at the SAME block as the commit is rejected: the min-delay
+        // window forces the reveal to a strictly later block (CRITICAL #1c).
         let err = execute(
             deps.as_mut(),
             env2.clone(),
+            message_info(&submitter, &[]),
+            ExecuteMsg::RevealRandomness {
+                round_id: 1,
+                value: value.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::RevealTooEarly { .. }));
+
+        // Advance one block so the reveal window opens.
+        let mut env3 = env2.clone();
+        env3.block.height += 1;
+        env3.block.time = Timestamp::from_seconds(env3.block.time.seconds() + 6);
+
+        // Wrong reveal (bad pre-image) is rejected.
+        let err = execute(
+            deps.as_mut(),
+            env3.clone(),
             message_info(&submitter, &[]),
             ExecuteMsg::RevealRandomness {
                 round_id: 1,
@@ -2548,10 +3268,50 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ContractError::RevealMismatch));
 
-        // Correct reveal fulfils.
+        // A different authorized submitter cannot reveal someone else's commit.
+        let other = mk(&api, "other-op");
         execute(
             deps.as_mut(),
-            env2.clone(),
+            env3.clone(),
+            message_info(&admin, &[]),
+            ExecuteMsg::SetConfig {
+                admin: None,
+                ticket_price: None,
+                draw_interval: None,
+                split: None,
+                rollover_on_no_winner: None,
+                randomness_mode: None,
+                verify_mode: None,
+                drand_pubkey: None,
+                drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
+                min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
+                add_submitters: Some(vec![other.to_string()]),
+                remove_submitters: None,
+            },
+        )
+        .unwrap();
+        let err = execute(
+            deps.as_mut(),
+            env3.clone(),
+            message_info(&other, &[]),
+            ExecuteMsg::RevealRandomness {
+                round_id: 1,
+                value: value.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::NotCommitter { .. }));
+
+        // Correct reveal by the committer fulfils. The consumed seed is the
+        // hardened derivation: sha256(value || ticket_entropy || time_be || height_be).
+        execute(
+            deps.as_mut(),
+            env3.clone(),
             message_info(&submitter, &[]),
             ExecuteMsg::RevealRandomness {
                 round_id: 1,
@@ -2562,15 +3322,24 @@ mod tests {
         let r = round(&deps, 1);
         let req = r.randomness.unwrap();
         assert!(matches!(req.status, RandomnessStatus::Fulfilled));
+        let mut preimage = value.to_vec();
+        preimage.extend_from_slice(&[0u8; 32]); // no tickets bought => zero entropy
+        preimage.extend_from_slice(&env3.block.time.seconds().to_be_bytes());
+        preimage.extend_from_slice(&env3.block.height.to_be_bytes());
         assert_eq!(
             req.randomness.unwrap(),
+            HexBinary::from(sha256(&preimage))
+        );
+        // The hardened seed differs from the naive sha256(value).
+        assert_ne!(
+            HexBinary::from(sha256(&preimage)),
             HexBinary::from(sha256(value.as_slice()))
         );
 
         // Draw succeeds.
         execute(
             deps.as_mut(),
-            env2,
+            env3,
             message_info(&admin, &[]),
             ExecuteMsg::Draw { round_id: 1 },
         )
@@ -2672,8 +3441,13 @@ mod tests {
                 verify_mode: None,
                 drand_pubkey: None,
                 drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
                 authorized_submitters: vec![submitter.to_string()],
                 min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
             },
         )
         .unwrap();
@@ -2684,6 +3458,246 @@ mod tests {
         let r2 = round(&deps, 2);
         assert_eq!(r2.rolled_over_from, None);
         assert_eq!(r2.pool, Uint128::zero());
+    }
+
+    // --- "Must Be Won" forced rolldown --------------------------------------
+
+    /// Instantiate with an explicit `max_dry_rounds` (mock randomness, dev
+    /// verify, one submitter). Mirrors `setup()` but parameterizes the cap.
+    fn setup_cap(max_dry_rounds: u64) -> (OD, MockApi, Env, Addr, Addr) {
+        let mut deps = mock_dependencies();
+        let api = deps.api;
+        let env = mock_env();
+        let admin = mk(&api, "admin");
+        let submitter = mk(&api, "relayer");
+        let msg = InstantiateMsg {
+            admin: Some(admin.to_string()),
+            denom: None,
+            ticket_price: None,
+            draw_interval: Some(DRAW_INTERVAL),
+            numbers_per_ticket: None,
+            number_max: None,
+            split: None,
+            rollover_on_no_winner: Some(true),
+            randomness_mode: None,
+            verify_mode: None,
+            drand_pubkey: None,
+            drand_chain_hash: None,
+            drand_genesis_time: None,
+            drand_period: None,
+            authorized_submitters: vec![submitter.to_string()],
+            min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: Some(max_dry_rounds),
+        };
+        instantiate(deps.as_mut(), env.clone(), message_info(&admin, &[]), msg).unwrap();
+        (deps, api, env, admin, submitter)
+    }
+
+    /// Build a valid 6-number pick (distinct, 1..=45) that matches EXACTLY `n`
+    /// of `winning`: take `n` winning numbers, fill the rest from `1..=45`
+    /// values NOT present in `winning`.
+    fn picks_matching(winning: &[u8], n: usize) -> Vec<u8> {
+        let mut picks: Vec<u8> = winning.iter().copied().take(n).collect();
+        let mut v: u8 = 1;
+        while picks.len() < 6 && v <= 45 {
+            if !winning.contains(&v) && !picks.contains(&v) {
+                picks.push(v);
+            }
+            v += 1;
+        }
+        picks.sort_unstable();
+        picks
+    }
+
+    /// Close + submit mock randomness + draw an arbitrary `round_id`. Returns
+    /// the derived winning numbers for that round.
+    fn run_draw_round(
+        deps: &mut OD,
+        env: &mut Env,
+        submitter: &Addr,
+        round_id: u64,
+        randomness: HexBinary,
+    ) -> Vec<u8> {
+        advance(env, DRAW_INTERVAL + 1);
+        let keeper = mk(&deps.api, "keeper");
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&keeper, &[]),
+            ExecuteMsg::CloseRound {},
+        )
+        .unwrap();
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(submitter, &[]),
+            ExecuteMsg::SubmitRandomness {
+                round_id,
+                randomness: randomness.clone(),
+                signature: None,
+            },
+        )
+        .unwrap();
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&keeper, &[]),
+            ExecuteMsg::Draw { round_id },
+        )
+        .unwrap();
+        derive_winning_numbers(randomness.as_slice(), 6, 45)
+    }
+
+    #[test]
+    fn rolldown_forces_after_cap() {
+        // max_dry_rounds = 3: rounds 1 & 2 roll over (streak 1, 2); round 3
+        // FORCES the jackpot allocation down to the best present lower tier.
+        let (mut deps, api, mut env, _admin, submitter) = setup_cap(3);
+        let buyer = mk(&api, "buyer");
+
+        // For each of 3 rounds: buy a ticket matching exactly 5 (never 6), so a
+        // dry round always has a tier-5 winner to roll DOWN into.
+        let rand_bytes: [u8; 3] = [0x11, 0x22, 0x33];
+        let mut r1_pool_pre = Uint128::zero();
+        for (i, b) in rand_bytes.iter().enumerate() {
+            let round_id = (i + 1) as u64;
+            let randomness = HexBinary::from(vec![*b; 32]);
+            let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+            let picks = picks_matching(&winning, 5);
+            buy(&mut deps, &env, &buyer, 1, Some(picks), None).unwrap();
+            if round_id == 3 {
+                r1_pool_pre = round(&deps, 3).pool; // pre-draw pool of round 3
+            }
+            run_draw_round(&mut deps, &mut env, &submitter, round_id, randomness.clone());
+        }
+
+        // Rounds 1 & 2 were dry with no forced rolldown: they rolled over.
+        let r1 = round(&deps, 1);
+        let r2 = round(&deps, 2);
+        assert_eq!(r1.winning_tickets, 1); // the tier-5 winner
+        assert_eq!(r2.winning_tickets, 1);
+        assert_eq!(r2.rolled_over_from, Some(1)); // round 1 leftover rolled into 2
+
+        // Round 3 is the forced round: tier-6 allocation rolled DOWN to tier 5.
+        let r3 = round(&deps, 3);
+        // Without the rolldown, tier_5 would be 20% of pool / 1 winner. With the
+        // forced rolldown it also receives the 60% jackpot allocation.
+        let tier5_base = r1_pool_pre.multiply_ratio(TIER5_BPS, 10_000u128);
+        let tier6_alloc = r1_pool_pre.multiply_ratio(TIER6_BPS, 10_000u128);
+        assert_eq!(r3.prize_tiers.tier_5, tier5_base + tier6_alloc);
+        // No jackpot paid (tier_6 per-winner stays zero — no 6-match ticket).
+        assert_eq!(r3.prize_tiers.tier_6, Uint128::zero());
+
+        // dry_streak reset to 0 after the forced rolldown.
+        assert_eq!(r3.dry_streak, 0);
+        // The next round did NOT get the jackpot allocation rolled over (it was
+        // distributed): its seeded pool is only the leftover dust, well under a
+        // full jackpot allocation.
+        let r4 = round(&deps, 4);
+        assert!(r4.pool < tier6_alloc);
+
+        // Pool accounting holds: distributed (= r3.pool retained) <= pre pool.
+        assert!(r3.pool <= r1_pool_pre);
+    }
+
+    #[test]
+    fn rolldown_streak_increments_then_resets() {
+        // Observe dry_streak grow 1 -> 2 across two dry rounds under a high cap
+        // (5) so no forced rolldown fires, then a jackpot win resets to 0.
+        let (mut deps, api, mut env, _admin, submitter) = setup_cap(5);
+        let buyer = mk(&api, "buyer");
+
+        // Round 1: dry (match 4 only) -> streak 1.
+        let rnd1 = HexBinary::from(vec![0x41; 32]);
+        let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w1, 4)), None).unwrap();
+        run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
+        assert_eq!(round(&deps, 1).dry_streak, 1);
+
+        // Round 2: dry again -> streak 2.
+        let rnd2 = HexBinary::from(vec![0x42; 32]);
+        let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 4)), None).unwrap();
+        run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
+        assert_eq!(round(&deps, 2).dry_streak, 2);
+
+        // Round 3: NATURAL jackpot win (match 6) -> resets streak to 0, no force.
+        let rnd3 = HexBinary::from(vec![0x43; 32]);
+        let w3 = derive_winning_numbers(rnd3.as_slice(), 6, 45);
+        buy(&mut deps, &env, &buyer, 1, Some(w3.clone()), None).unwrap();
+        run_draw_round(&mut deps, &mut env, &submitter, 3, rnd3);
+        let r3 = round(&deps, 3);
+        assert!(r3.prize_tiers.tier_6 > Uint128::zero()); // jackpot actually paid
+        assert_eq!(r3.dry_streak, 0);
+    }
+
+    #[test]
+    fn rolldown_cannot_fabricate_winner() {
+        // Forced round with NO ticket matching >= 3: the guarantee can't create a
+        // winner, so it rolls over and the streak persists (reaches the cap).
+        let (mut deps, api, mut env, _admin, submitter) = setup_cap(2);
+        let buyer = mk(&api, "buyer");
+
+        // Round 1: dry, no lower-tier winner (match 0) -> streak 1.
+        let rnd1 = HexBinary::from(vec![0x51; 32]);
+        let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w1, 0)), None).unwrap();
+        run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
+        assert_eq!(round(&deps, 1).dry_streak, 1);
+
+        // Round 2: hits the cap and would force, but NO ticket matches >= 3.
+        let rnd2 = HexBinary::from(vec![0x52; 32]);
+        let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 0)), None).unwrap();
+        let pool_pre = round(&deps, 2).pool;
+        run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
+
+        let r2 = round(&deps, 2);
+        // Nothing distributed (no winner at any tier), streak persisted past cap.
+        assert_eq!(r2.winning_tickets, 0);
+        assert_eq!(r2.dry_streak, 2); // NOT reset — no forced payout possible
+        assert_eq!(r2.pool, Uint128::zero()); // retained pool = distributed = 0
+        // The full pool rolled over to round 3 (rollover enabled).
+        assert_eq!(round(&deps, 3).pool, pool_pre);
+        assert_eq!(round(&deps, 3).rolled_over_from, Some(2));
+    }
+
+    #[test]
+    fn rolldown_pool_accounting_holds() {
+        // Under a forced rolldown, distributed <= pool and every usaf is
+        // accounted for (distributed retained + rollover seeds next round).
+        let (mut deps, api, mut env, _admin, submitter) = setup_cap(1);
+        let buyer = mk(&api, "buyer");
+
+        // max_dry_rounds = 1: the very first dry round forces immediately.
+        let rnd = HexBinary::from(vec![0x61; 32]);
+        let w = derive_winning_numbers(rnd.as_slice(), 6, 45);
+        // Two tier-3 winners so the jackpot alloc splits (exercises remainder).
+        let buyer2 = mk(&api, "buyer2");
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w, 3)), None).unwrap();
+        buy(&mut deps, &env, &buyer2, 1, Some(picks_matching(&w, 3)), None).unwrap();
+        let pool_pre = round(&deps, 1).pool;
+        run_draw_round(&mut deps, &mut env, &submitter, 1, rnd);
+
+        let r1 = round(&deps, 1);
+        let r2 = round(&deps, 2);
+        // Forced rolldown to tier 3 fired: streak reset, jackpot boosted tier_3.
+        assert_eq!(r1.dry_streak, 0);
+        let tier3_base = pool_pre.multiply_ratio(TIER3_BPS, 10_000u128);
+        let tier6_alloc = pool_pre.multiply_ratio(TIER6_BPS, 10_000u128);
+        // Two winners share (tier-3 alloc + jackpot alloc); per-winner is the
+        // floor of each split, so tier_3 >= base per-winner.
+        let per_winner_base = tier3_base.multiply_ratio(1u128, 2u128);
+        assert!(r1.prize_tiers.tier_3 >= per_winner_base);
+        // distributed = retained pool never exceeds the pre-draw pool.
+        assert!(r1.pool <= pool_pre);
+        // Every usaf accounted: retained (distributed) + rolled-over == pool_pre.
+        assert_eq!(r1.pool + r2.pool, pool_pre);
+        // The boost really moved the jackpot allocation into tier 3 (not tier 6).
+        assert_eq!(r1.prize_tiers.tier_6, Uint128::zero());
+        assert!(tier6_alloc > Uint128::zero());
     }
 
     // --- claim --------------------------------------------------------------
@@ -2892,7 +3906,8 @@ mod tests {
 
     #[test]
     fn register_code_conflict_for_other_owner() {
-        let (mut deps, api, _env, _admin, _sub) = setup();
+        let (mut deps, api, env, admin, _sub) = setup();
+        open_code_registration(&mut deps, &env, &admin);
         let a = mk(&api, "a");
         let b = mk(&api, "b");
         execute(
@@ -2914,6 +3929,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ContractError::Unauthorized { .. }));
+    }
+
+    /// Test helper: enable permissionless referral-code registration.
+    fn open_code_registration(deps: &mut OD, env: &Env, admin: &Addr) {
+        let mut msg = set_config_none();
+        if let ExecuteMsg::SetConfig {
+            open_code_registration,
+            ..
+        } = &mut msg
+        {
+            *open_code_registration = Some(true);
+        }
+        execute(deps.as_mut(), env.clone(), message_info(admin, &[]), msg).unwrap();
+    }
+
+    #[test]
+    fn register_code_admin_only_by_default() {
+        // Default (closed) registration: a non-admin cannot claim a new code,
+        // but the admin can (anti-squatting, LOW #26).
+        let (mut deps, api, _env, admin, _sub) = setup();
+        let squatter = mk(&api, "squatter");
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&squatter, &[]),
+            ExecuteMsg::RegisterCode {
+                code: "brand".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Unauthorized { .. }));
+
+        // Admin reserves it.
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&admin, &[]),
+            ExecuteMsg::RegisterCode {
+                code: "brand".to_string(),
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2999,8 +4056,13 @@ mod tests {
                 verify_mode: None,
                 drand_pubkey: None,
                 drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
                 authorized_submitters: vec![],
                 min_claim_usaf: Some(Uint128::new(10_000_000)), // high floor
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
             },
         )
         .unwrap();
@@ -3148,16 +4210,19 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ContractError::Unauthorized { .. }));
 
-        // Bad split rejected.
+        // Changing `split` while a round is Open (in-flight) is rejected by the
+        // MEDIUM #16 guardrail before split validation even runs; economics may
+        // only change between rounds.
         let mut msg = set_config_none();
         if let ExecuteMsg::SetConfig { split, .. } = &mut msg {
             *split = Some(FundSplitBps::new_unchecked(5000, 1000, 1500));
         }
         let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
             .unwrap_err();
-        assert!(matches!(err, ContractError::Shared(_)));
+        assert!(matches!(err, ContractError::InvalidConfig { .. }));
 
-        // Valid update.
+        // Valid mid-round update: draw_interval / rollover are always allowed
+        // (draw_interval only affects the next round; closes_at is frozen at open).
         let mut msg = set_config_none();
         if let ExecuteMsg::SetConfig {
             draw_interval,
@@ -3208,7 +4273,12 @@ mod tests {
             verify_mode: None,
             drand_pubkey: None,
             drand_chain_hash: None,
+            drand_genesis_time: None,
+            drand_period: None,
             min_claim_usaf: None,
+            reveal_timeout: None,
+            open_code_registration: None,
+            max_dry_rounds: None,
             add_submitters: None,
             remove_submitters: None,
         }
@@ -3302,5 +4372,660 @@ mod tests {
             from_json(query(deps.as_ref(), mock_env(), QueryMsg::TreasuryBalance {}).unwrap())
                 .unwrap();
         assert_eq!(tb.balance, Uint128::zero());
+    }
+
+    // --- GrantBonusTicket (operator-sponsored bonus tickets) ---------------
+
+    /// Grant `count` operator-sponsored bonus tickets to `owner`, attaching the
+    /// (optionally overridden) funds. Mirrors the `buy` test helper.
+    fn grant(
+        deps: &mut OD,
+        env: &Env,
+        caller: &Addr,
+        owner: &Addr,
+        count: u32,
+        numbers: Option<Vec<u8>>,
+        funds: Option<Vec<Coin>>,
+    ) -> Result<Response, ContractError> {
+        let funds = funds.unwrap_or_else(|| coins(TICKET_PRICE * count as u128, DENOM));
+        let info = message_info(caller, &funds);
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            info,
+            ExecuteMsg::GrantBonusTicket {
+                owner: owner.to_string(),
+                count,
+                numbers,
+            },
+        )
+    }
+
+    /// Fetch all tickets in a round owned by `owner`.
+    fn tickets_of(deps: &OD, round_id: u64, owner: &Addr) -> Vec<TicketInfo> {
+        let res: TicketsResponse = from_json(
+            query(
+                deps.as_ref(),
+                mock_env(),
+                QueryMsg::Tickets {
+                    round_id,
+                    owner: Some(owner.to_string()),
+                    start_after: None,
+                    limit: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        res.tickets
+    }
+
+    #[test]
+    fn grant_mints_free_tickets_owned_by_owner_and_funds_pool() {
+        let (mut deps, api, env, admin, submitter) = setup();
+        let owner = mk(&api, "xp_redeemer");
+
+        // A submitter (not admin) grants 2 bonus tickets to `owner`.
+        let pool_before = current(&deps).pool;
+        grant(&mut deps, &env, &submitter, &owner, 2, None, None).unwrap();
+
+        // Pool grew by count * ticket_price in full (no split).
+        let r = current(&deps);
+        assert_eq!(r.pool, pool_before + Uint128::new(2 * TICKET_PRICE));
+        assert_eq!(r.ticket_count, 2);
+        // `owner` is counted as a player.
+        assert_eq!(r.player_count, 1);
+
+        // The two tickets are owned by `owner` and flagged free with valid picks.
+        let owned = tickets_of(&deps, 1, &owner);
+        assert_eq!(owned.len(), 2);
+        for t in &owned {
+            assert!(t.ticket.free);
+            assert_eq!(t.ticket.owner, owner);
+            assert_eq!(t.ticket.numbers.len(), 6);
+            assert!(t.ticket.numbers.iter().all(|n| (1..=45).contains(n)));
+        }
+
+        // Admin may also grant (auth = admin OR submitter).
+        grant(&mut deps, &env, &admin, &owner, 1, None, None).unwrap();
+        assert_eq!(current(&deps).ticket_count, 3);
+    }
+
+    #[test]
+    fn grant_unauthorized_caller_rejected() {
+        let (mut deps, api, env, _admin, _sub) = setup();
+        let stranger = mk(&api, "stranger");
+        let owner = mk(&api, "owner");
+        let err = grant(&mut deps, &env, &stranger, &owner, 1, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::UnauthorizedSubmitter));
+    }
+
+    #[test]
+    fn grant_wrong_or_missing_funds_rejected() {
+        let (mut deps, api, env, _admin, submitter) = setup();
+        let owner = mk(&api, "owner");
+
+        // Too little for 2 tickets.
+        let err = grant(
+            &mut deps,
+            &env,
+            &submitter,
+            &owner,
+            2,
+            None,
+            Some(coins(TICKET_PRICE, DENOM)),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Shared(_)));
+
+        // No funds at all.
+        let err = grant(&mut deps, &env, &submitter, &owner, 1, None, Some(vec![]))
+            .unwrap_err();
+        assert!(matches!(err, ContractError::Shared(_)));
+
+        // Foreign denom.
+        let err = grant(
+            &mut deps,
+            &env,
+            &submitter,
+            &owner,
+            1,
+            None,
+            Some(coins(TICKET_PRICE, "uatom")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Shared(_)));
+    }
+
+    #[test]
+    fn grant_on_non_open_round_rejected() {
+        let (mut deps, api, env, _admin, submitter) = setup();
+        let owner = mk(&api, "owner");
+
+        // Close the round → status Drawing, no longer accepts tickets.
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&submitter, &[]),
+            ExecuteMsg::CloseRound {},
+        )
+        .unwrap();
+
+        let err = grant(&mut deps, &env2, &submitter, &owner, 1, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::RoundNotOpen { .. }));
+    }
+
+    #[test]
+    fn grant_out_of_domain_numbers_rejected_none_quickpicks() {
+        let (mut deps, api, env, _admin, submitter) = setup();
+        let owner = mk(&api, "owner");
+
+        // Out-of-domain explicit picks are rejected (46 > number_max 45).
+        let err = grant(
+            &mut deps,
+            &env,
+            &submitter,
+            &owner,
+            1,
+            Some(vec![1, 2, 3, 4, 5, 46]),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidNumbers { .. }));
+
+        // Duplicate picks rejected too.
+        let err = grant(
+            &mut deps,
+            &env,
+            &submitter,
+            &owner,
+            1,
+            Some(vec![1, 1, 3, 4, 5, 6]),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidNumbers { .. }));
+
+        // `None` quick-picks valid in-range numbers.
+        grant(&mut deps, &env, &submitter, &owner, 1, None, None).unwrap();
+        let owned = tickets_of(&deps, 1, &owner);
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].ticket.numbers.len(), 6);
+        assert!(owned[0].ticket.numbers.iter().all(|n| (1..=45).contains(n)));
+    }
+
+    #[test]
+    fn granted_bonus_ticket_can_win_and_be_claimed() {
+        // Full cycle: a paid buy + a granted bonus ticket that matches the drawn
+        // numbers WINS and is claimable by `owner`.
+        let (mut deps, api, env, _admin, submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        let owner = mk(&api, "xp_redeemer");
+        let randomness = HexBinary::from(vec![7u8; 32]);
+        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+
+        // A normal paid buy (non-winning quick-pick would be fine, but give it a
+        // 3-match so the pool has multiple tiers) and a granted JACKPOT ticket.
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&winning, 3)), None).unwrap();
+        grant(
+            &mut deps,
+            &env,
+            &submitter,
+            &owner,
+            1,
+            Some(winning.clone()),
+            None,
+        )
+        .unwrap();
+
+        // The granted ticket is free and owned by `owner`.
+        let owned = tickets_of(&deps, 1, &owner);
+        assert_eq!(owned.len(), 1);
+        assert!(owned[0].ticket.free);
+        let bonus_ticket_id = owned[0].ticket_id.clone();
+
+        // Close → submit randomness → draw.
+        run_draw(&mut deps, &env, &submitter, randomness);
+        assert_eq!(round(&deps, 1).status, RoundStatus::Settled);
+
+        // The bonus ticket matched all 6 (jackpot) and carries a non-zero prize.
+        let owned = tickets_of(&deps, 1, &owner);
+        assert_eq!(owned[0].ticket.matches, 6);
+        let prize = owned[0].ticket.prize;
+        assert!(!prize.is_zero());
+        assert!(owned[0].ticket.free); // still flagged free after the draw
+
+        // `owner` claims the bonus ticket's prize.
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::ClaimReward {
+                round_id: 1,
+                ticket_id: bonus_ticket_id.clone(),
+            },
+        )
+        .unwrap();
+        assert!(res.messages.iter().any(|m| matches!(
+            &m.msg,
+            CosmosMsg::Bank(BankMsg::Send { to_address, amount })
+                if to_address == &owner.to_string() && amount[0].amount == prize
+        )));
+
+        // Double-claim guarded.
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::ClaimReward {
+                round_id: 1,
+                ticket_id: bonus_ticket_id,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::AlreadyClaimed { .. }));
+    }
+
+    // --- CancelRound recovery (MEDIUM #15 / HIGH #7) ------------------------
+
+    /// Instantiate a commit-reveal contract with one submitter, returning
+    /// (deps, api, env, admin, submitter).
+    fn setup_commit_reveal() -> (OD, MockApi, Env, Addr, Addr) {
+        let mut deps = mock_dependencies();
+        let api = deps.api;
+        let env = mock_env();
+        let admin = mk(&api, "admin");
+        let submitter = mk(&api, "operator");
+        instantiate(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &[]),
+            InstantiateMsg {
+                admin: Some(admin.to_string()),
+                denom: None,
+                ticket_price: None,
+                draw_interval: Some(DRAW_INTERVAL),
+                numbers_per_ticket: None,
+                number_max: None,
+                split: None,
+                rollover_on_no_winner: None,
+                randomness_mode: Some(RandomnessMode::CommitReveal),
+                verify_mode: Some(VerifyMode::Dev),
+                drand_pubkey: None,
+                drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
+                authorized_submitters: vec![submitter.to_string()],
+                min_claim_usaf: None,
+                reveal_timeout: Some(3600),
+                open_code_registration: None,
+                max_dry_rounds: None,
+            },
+        )
+        .unwrap();
+        (deps, api, env, admin, submitter)
+    }
+
+    #[test]
+    fn cancel_stuck_round_refunds_and_advances_lifecycle() {
+        // A round is closed, randomness never fulfilled; admin cancels it. Buyers
+        // get pro-rata refunds and the next round opens so sales resume.
+        let (mut deps, api, env, admin, _sub) = setup_commit_reveal();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 2, None, None).unwrap();
+
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&buyer, &[]),
+            ExecuteMsg::CloseRound {},
+        )
+        .unwrap();
+        assert_eq!(round(&deps, 1).status, RoundStatus::Drawing);
+
+        // Non-admin cannot cancel before the recovery timeout.
+        let stranger = mk(&api, "stranger");
+        let err = execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&stranger, &[]),
+            ExecuteMsg::CancelRound { round_id: 1 },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::CannotCancel { .. }));
+
+        // Admin cancels immediately.
+        let retained_pool = round(&deps, 1).pool;
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&admin, &[]),
+            ExecuteMsg::CancelRound { round_id: 1 },
+        )
+        .unwrap();
+
+        // Round 1 cancelled, next round open and current.
+        assert_eq!(round(&deps, 1).status, RoundStatus::Cancelled);
+        let r2 = current(&deps);
+        assert_eq!(r2.id, 2);
+        assert_eq!(r2.status, RoundStatus::Open);
+
+        // New round accepts tickets.
+        buy(&mut deps, &env2, &buyer, 1, None, None).unwrap();
+
+        // Buyer pulls a refund on each cancelled-round ticket (pro-rata).
+        let per_ticket = retained_pool / Uint128::from(2u128);
+        for id in [ticket_id(0), ticket_id(1)] {
+            let res = execute(
+                deps.as_mut(),
+                env2.clone(),
+                message_info(&buyer, &[]),
+                ExecuteMsg::ClaimReward {
+                    round_id: 1,
+                    ticket_id: id,
+                },
+            )
+            .unwrap();
+            assert!(res.messages.iter().any(|m| matches!(
+                &m.msg,
+                CosmosMsg::Bank(BankMsg::Send { to_address, amount })
+                    if to_address == &buyer.to_string() && amount[0].amount == per_ticket
+            )));
+        }
+        // Cancelled round's pool is fully drained by the two refunds.
+        assert!(round(&deps, 1).pool <= retained_pool - per_ticket * Uint128::from(2u128));
+    }
+
+    #[test]
+    fn cancel_permissionless_after_grace() {
+        // After closes_at + CANCEL_GRACE_SECONDS anyone may cancel a stuck round.
+        let (mut deps, api, env, _admin, _sub) = setup_commit_reveal();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&buyer, &[]),
+            ExecuteMsg::CloseRound {},
+        )
+        .unwrap();
+
+        // Warp past the grace window.
+        let mut env3 = env2.clone();
+        env3.block.time =
+            Timestamp::from_seconds(round(&deps, 1).closes_at + CANCEL_GRACE_SECONDS + 1);
+        let anyone = mk(&api, "anyone");
+        execute(
+            deps.as_mut(),
+            env3,
+            message_info(&anyone, &[]),
+            ExecuteMsg::CancelRound { round_id: 1 },
+        )
+        .unwrap();
+        assert_eq!(round(&deps, 1).status, RoundStatus::Cancelled);
+        assert_eq!(current(&deps).id, 2);
+    }
+
+    #[test]
+    fn cancel_rejected_when_randomness_fulfilled() {
+        // A round whose randomness is fulfilled must be drawn, not cancelled.
+        let (mut deps, _api, env, admin, submitter) = setup();
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&submitter, &[]),
+            ExecuteMsg::CloseRound {},
+        )
+        .unwrap();
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&submitter, &[]),
+            ExecuteMsg::SubmitRandomness {
+                round_id: 1,
+                randomness: HexBinary::from(vec![1u8; 32]),
+                signature: None,
+            },
+        )
+        .unwrap();
+        let err = execute(
+            deps.as_mut(),
+            env2,
+            message_info(&admin, &[]),
+            ExecuteMsg::CancelRound { round_id: 1 },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::CannotCancel { .. }));
+    }
+
+    #[test]
+    fn cancel_rejected_on_open_round() {
+        let (mut deps, _api, env, admin, _sub) = setup();
+        let err = execute(
+            deps.as_mut(),
+            env,
+            message_info(&admin, &[]),
+            ExecuteMsg::CancelRound { round_id: 1 },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::CannotCancel { .. }));
+    }
+
+    // --- Randomness hardening (CRITICAL #1 / HIGH #7) -----------------------
+
+    #[test]
+    fn reveal_seed_depends_on_ticket_entropy() {
+        // Two contracts with the SAME committed value but DIFFERENT ticket sets
+        // must produce DIFFERENT consumed randomness, proving the seed mixes the
+        // per-round ticket-entropy accumulator (CRITICAL #1a/#1b).
+        fn run(with_extra_ticket: bool) -> HexBinary {
+            let (mut deps, api, env, _admin, submitter) = setup_commit_reveal();
+            let buyer = mk(&api, "buyer");
+            buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
+            if with_extra_ticket {
+                let buyer2 = mk(&api, "buyer2");
+                buy(&mut deps, &env, &buyer2, 1, Some(vec![7, 8, 9, 10, 11, 12]), None).unwrap();
+            }
+
+            let mut env2 = env.clone();
+            advance(&mut env2, DRAW_INTERVAL + 1);
+            execute(
+                deps.as_mut(),
+                env2.clone(),
+                message_info(&submitter, &[]),
+                ExecuteMsg::CloseRound {},
+            )
+            .unwrap();
+
+            let value = HexBinary::from(vec![0x5Au8; 32]);
+            let commitment = HexBinary::from(sha256(value.as_slice()));
+            execute(
+                deps.as_mut(),
+                env2.clone(),
+                message_info(&submitter, &[]),
+                ExecuteMsg::CommitRandomness {
+                    round_id: 1,
+                    commitment,
+                },
+            )
+            .unwrap();
+
+            // Reveal at a fixed later block so time/height are equal across runs;
+            // only ticket_entropy differs.
+            let mut env3 = env2.clone();
+            env3.block.height += 1;
+            execute(
+                deps.as_mut(),
+                env3,
+                message_info(&submitter, &[]),
+                ExecuteMsg::RevealRandomness {
+                    round_id: 1,
+                    value,
+                },
+            )
+            .unwrap();
+            round(&deps, 1).randomness.unwrap().randomness.unwrap()
+        }
+
+        let a = run(false);
+        let b = run(true);
+        assert_ne!(a, b, "ticket entropy must change the consumed seed");
+    }
+
+    #[test]
+    fn set_config_rejects_mock_and_dev_in_production_build() {
+        // In the shipped wasm (no `dev-randomness` feature) SetConfig cannot
+        // switch into Mock randomness or Dev verify (MEDIUM #16). This test runs
+        // under the default feature set, matching the deployable artifact.
+        // (Skipped when the crate is compiled WITH the dev-randomness feature.)
+        if cfg!(feature = "dev-randomness") {
+            return;
+        }
+        // Use a Drand/Bls contract so we're not already in Mock/Dev, and there's
+        // no in-flight economics guard collision for these specific fields.
+        let mut deps = mock_dependencies();
+        let api = deps.api;
+        let admin = mk(&api, "admin");
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&admin, &[]),
+            InstantiateMsg {
+                admin: Some(admin.to_string()),
+                denom: None,
+                ticket_price: None,
+                draw_interval: Some(DRAW_INTERVAL),
+                numbers_per_ticket: None,
+                number_max: None,
+                split: None,
+                rollover_on_no_winner: None,
+                randomness_mode: Some(RandomnessMode::Drand),
+                verify_mode: Some(VerifyMode::Bls),
+                drand_pubkey: Some(HexBinary::from(vec![1u8; G2_LEN])),
+                drand_chain_hash: Some("abcd".to_string()),
+                drand_genesis_time: None,
+                drand_period: None,
+                authorized_submitters: vec![],
+                min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
+            },
+        )
+        .unwrap();
+
+        // Switch to Mock rejected.
+        let mut msg = set_config_none();
+        if let ExecuteMsg::SetConfig { randomness_mode, .. } = &mut msg {
+            *randomness_mode = Some(RandomnessMode::Mock);
+        }
+        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
+            .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidConfig { .. }));
+
+        // Switch to Dev verify rejected.
+        let mut msg = set_config_none();
+        if let ExecuteMsg::SetConfig { verify_mode, .. } = &mut msg {
+            *verify_mode = Some(VerifyMode::Dev);
+        }
+        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
+            .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidConfig { .. }));
+    }
+
+    // --- Dust disposal (LOW #25) --------------------------------------------
+
+    #[test]
+    fn draw_jackpot_win_rolls_dust_to_next_round() {
+        // On a jackpot win, tier allocations for empty tiers + rounding dust used
+        // to strand in the settled round. They must now roll to the next round so
+        // nothing leaks. (rollover enabled: setup() default.)
+        let (mut deps, api, env, _admin, submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        let randomness = HexBinary::from(vec![7u8; 32]);
+        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        // Single jackpot ticket: tiers 3/4/5 have no winners, so ~40% of the pool
+        // is unassigned leftover that must roll forward.
+        buy(&mut deps, &env, &buyer, 1, Some(winning.clone()), None).unwrap();
+
+        let pool_before = current(&deps).pool;
+        run_draw(&mut deps, &env, &submitter, randomness);
+
+        let r1 = round(&deps, 1);
+        let r2 = round(&deps, 2);
+        // Round 1 retains only the jackpot payout (distributed).
+        assert_eq!(r1.pool, r1.prize_tiers.tier_6);
+        // The remainder rolled into round 2; nothing stranded.
+        assert_eq!(r1.pool + r2.pool, pool_before);
+        assert!(r2.pool > Uint128::zero());
+        assert_eq!(r2.rolled_over_from, Some(1));
+    }
+
+    #[test]
+    fn draw_no_rollover_sweeps_dust_to_treasury() {
+        // With rollover disabled, unassigned leftover is swept to the treasury
+        // (not stranded, not rolled) so every usaf stays accounted (LOW #25).
+        let mut deps = mock_dependencies();
+        let api = deps.api;
+        let env = mock_env();
+        let admin = mk(&api, "admin");
+        let submitter = mk(&api, "relayer");
+        instantiate(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &[]),
+            InstantiateMsg {
+                admin: Some(admin.to_string()),
+                denom: None,
+                ticket_price: None,
+                draw_interval: Some(DRAW_INTERVAL),
+                numbers_per_ticket: None,
+                number_max: None,
+                split: None,
+                rollover_on_no_winner: Some(false),
+                randomness_mode: None,
+                verify_mode: None,
+                drand_pubkey: None,
+                drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
+                authorized_submitters: vec![submitter.to_string()],
+                min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
+            },
+        )
+        .unwrap();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
+
+        let treasury_before: TreasuryBalanceResponse =
+            from_json(query(deps.as_ref(), mock_env(), QueryMsg::TreasuryBalance {}).unwrap())
+                .unwrap();
+        let pool_before = current(&deps).pool;
+
+        run_draw(&mut deps, &env, &submitter, HexBinary::from(vec![0x22u8; 32]));
+
+        let r1 = round(&deps, 1);
+        let r2 = round(&deps, 2);
+        // Nothing rolled forward.
+        assert_eq!(r2.rolled_over_from, None);
+        assert_eq!(r2.pool, Uint128::zero());
+        // The leftover (pool minus any assigned lower-tier prizes) went to treasury.
+        let treasury_after: TreasuryBalanceResponse =
+            from_json(query(deps.as_ref(), mock_env(), QueryMsg::TreasuryBalance {}).unwrap())
+                .unwrap();
+        let swept = treasury_after.balance - treasury_before.balance;
+        assert_eq!(r1.pool + swept, pool_before, "every usaf accounted");
     }
 }

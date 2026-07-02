@@ -17,8 +17,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
-repository = "https://github.com/Dev-Community-IO/winsaf-contracts"
-homepage = "https://winsaf.xyz"
+repository = "https://github.com/safrochain/winsaf"
+homepage = "https://safrochain.com"
 
 # Shared dependency versions. Contract/package crates reference these with
 # `{ workspace = true }` so the whole tree stays on one consistent ABI.

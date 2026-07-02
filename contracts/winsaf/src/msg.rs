@@ -44,11 +44,24 @@ pub struct InstantiateMsg {
     pub drand_pubkey: Option<HexBinary>,
     /// drand chain hash — required for drand.
     pub drand_chain_hash: Option<String>,
+    /// drand beacon genesis time (unix seconds). `None` → drand quicknet default
+    /// (1692803367). Only meaningful in drand mode.
+    pub drand_genesis_time: Option<u64>,
+    /// drand beacon period (seconds). `None` → drand quicknet default (3).
+    pub drand_period: Option<u64>,
     /// Randomness submitters (relayer / keeper). Defaults to empty (admin-only).
     #[serde(default)]
     pub authorized_submitters: Vec<String>,
     /// Referral claim floor (usaf). `None` → 0 (no floor).
     pub min_claim_usaf: Option<Uint128>,
+    /// Commit-reveal reveal timeout (seconds). `None` → 3600.
+    pub reveal_timeout: Option<u64>,
+    /// Allow permissionless `RegisterCode`. `None`/`false` → admin-only code
+    /// registration (prevents referral-code squatting).
+    pub open_code_registration: Option<bool>,
+    /// "Must Be Won" cap: max consecutive dry rounds before a forced jackpot
+    /// rolldown to the best present lower tier. `None` → 5. `0` disables it.
+    pub max_dry_rounds: Option<u64>,
 }
 
 // ===========================================================================
@@ -67,6 +80,23 @@ pub enum ExecuteMsg {
         numbers: Option<Vec<u8>>,
         /// Optional referral code identifying the buyer's referrer.
         referral_code: Option<String>,
+    },
+
+    /// Authorized-submitter-or-admin only: mint `count` operator-sponsored bonus
+    /// tickets OWNED BY `owner`, flagged free, into the current open round. Backs
+    /// an off-chain "redeem XP for a free ticket" feature. The caller MUST attach
+    /// exactly `count * ticket_price` in `denom` (the operator sponsors the pool
+    /// contribution so the user pays nothing); the full amount is added to the
+    /// round pool so the granted tickets are honestly funded and can win / be
+    /// claimed by `owner` like any paid ticket. `numbers` (when provided) sets the
+    /// picks for the FIRST ticket; remaining tickets (and all when omitted) are
+    /// quick-picked — exactly like `BuyTickets`.
+    GrantBonusTicket {
+        /// Beneficiary who OWNS the minted bonus tickets.
+        owner: String,
+        count: u32,
+        /// Explicit picks for the first ticket; `None` = quick-pick all.
+        numbers: Option<Vec<u8>>,
     },
 
     /// Permissionless: close the current round once `closes_at` has passed.
@@ -100,8 +130,18 @@ pub enum ExecuteMsg {
     /// next round. Transitions `Drawing → Settled` and opens the next round.
     Draw { round_id: u64 },
 
-    /// Pull-based prize payout. Only the ticket owner may claim, only if the
-    /// prize is non-zero and not yet claimed.
+    /// Recover a stuck `Drawing` round whose randomness never fulfilled.
+    /// Admin may call at any time; anyone may call once
+    /// `closes_at + CANCEL_GRACE_SECONDS` has passed (or, in commit-reveal, once
+    /// the commitment's `reveal_deadline` has passed). Marks the round
+    /// `Cancelled`, converts the retained pool into pro-rata pull-refunds for
+    /// ticket buyers (claimed via `ClaimReward`), and opens the next round so the
+    /// lifecycle is never permanently blocked.
+    CancelRound { round_id: u64 },
+
+    /// Pull-based prize payout (or, for a `Cancelled` round, the buyer's pro-rata
+    /// refund). Only the ticket owner may claim, only if the assigned amount is
+    /// non-zero and not yet claimed.
     ClaimReward { round_id: u64, ticket_id: String },
 
     /// Bind the caller (referee) to a referrer, once and immutably. Provide a
@@ -133,7 +173,16 @@ pub enum ExecuteMsg {
         verify_mode: Option<VerifyMode>,
         drand_pubkey: Option<HexBinary>,
         drand_chain_hash: Option<String>,
+        drand_genesis_time: Option<u64>,
+        drand_period: Option<u64>,
         min_claim_usaf: Option<Uint128>,
+        /// Commit-reveal reveal timeout (seconds).
+        reveal_timeout: Option<u64>,
+        /// Toggle permissionless referral-code registration.
+        open_code_registration: Option<bool>,
+        /// "Must Be Won" cap: max consecutive dry rounds before a forced
+        /// jackpot rolldown. `0` disables the feature.
+        max_dry_rounds: Option<u64>,
         /// Submitters to ADD to the authorized set.
         add_submitters: Option<Vec<String>>,
         /// Submitters to REMOVE from the authorized set.
@@ -214,6 +263,15 @@ pub struct RoundResponse {
     pub winning_tickets: u64,
     /// Randomness state for this round, if any has been requested/delivered.
     pub randomness: Option<RandomnessRequest>,
+    /// Current global "Must Be Won" dry streak (consecutive settled rounds with
+    /// no jackpot winner that were not force-distributed). Lets the UI show
+    /// "must be won in K rounds" where `K = max_dry_rounds - dry_streak`.
+    ///
+    /// `#[serde(default)]` so responses/clients predating this field still
+    /// deserialize; it is populated on every round query from the global
+    /// `DRY_STREAK` item.
+    #[serde(default)]
+    pub dry_streak: u64,
 }
 
 /// A ticket paired with its stable id (round-local sequence).

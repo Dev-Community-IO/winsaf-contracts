@@ -144,6 +144,25 @@ pub enum ContractError {
     #[error("no commitment stored for round {round_id}")]
     NoCommitment { round_id: u64 },
 
+    /// Commit-reveal: the reveal was sent by an address other than the one that
+    /// posted the commitment. Only the committer may reveal.
+    #[error("only the committer may reveal randomness for round {round_id}")]
+    NotCommitter { round_id: u64 },
+
+    /// Commit-reveal: the reveal arrived too early. It must occur at a strictly
+    /// later block than the commit (minimum-delay window).
+    #[error("reveal too early for round {round_id}: commit at block {commit_height}, must reveal at block > {min_height}")]
+    RevealTooEarly {
+        round_id: u64,
+        commit_height: u64,
+        min_height: u64,
+    },
+
+    /// `CancelRound` was attempted on a round that is not in a cancellable state
+    /// or before its recovery conditions were met.
+    #[error("round {round_id} cannot be cancelled: {reason}")]
+    CannotCancel { round_id: u64, reason: String },
+
     /// The BLS public key (drand) is missing or malformed.
     #[error("invalid drand public key: {reason}")]
     InvalidPubkey { reason: String },

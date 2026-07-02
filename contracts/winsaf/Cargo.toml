@@ -32,6 +32,15 @@ crate-type = ["cdylib", "rlib"]
 # enables it.
 library = []
 
+# `dev-randomness` allows switching a LIVE contract into Mock randomness / Dev
+# verify mode via `SetConfig`. These modes have NO cryptographic guarantees and
+# let an authorized submitter pick the winning numbers outright, so they must
+# NEVER be reachable in a production/testnet wasm. The deployable artifact
+# (scripts/optimize.sh -> `cargo build --lib`) is built WITHOUT this feature, so
+# `SetConfig { randomness_mode: Mock | verify_mode: Dev }` is hard-rejected
+# on-chain. Enabled only for localnet builds and unit tests (dev-dependencies).
+dev-randomness = []
+
 [dependencies]
 cosmwasm-std = { workspace = true }
 cosmwasm-schema = { workspace = true }
