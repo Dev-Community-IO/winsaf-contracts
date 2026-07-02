@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Rust (fmt · clippy · test · wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all
+
+      - name: Build wasm (release)
+        run: cargo build --release --lib --target wasm32-unknown-unknown -p winsaf
+
+      - name: Verify deployment manifest JSON
+        run: |
+          python3 -c "import json; json.load(open('deployment-testnet.json'))"

@@ -1,0 +1,8 @@
+{
+  "network": "testnet",
+  "chainId": "safro-testnet-1",
+  "admin": "addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn",
+  "contract": "addr_safro14c70k3s6uqnywq3jfrhcrdvl3cq4atse0cvwjxm65hy0khesnunq534cka",
+  "codeId": 142,
+  "note": "Single consolidated winsaf contract (lottery+treasury+referral+randomness)."
+}

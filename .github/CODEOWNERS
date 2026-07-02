@@ -1,0 +1,6 @@
+# Default reviewers for contract changes
+* @Dev-Community-IO/core
+
+/packages/winsaf-shared/ @Dev-Community-IO/core
+/contracts/winsaf/ @Dev-Community-IO/core
+/scripts/ @Dev-Community-IO/core

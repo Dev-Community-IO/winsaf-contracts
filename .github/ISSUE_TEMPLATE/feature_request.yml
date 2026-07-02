@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a contract change (requires governance / upgrade path)
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Contract changes affect **on-chain economics and user funds**. Describe the problem first; implementation can follow in a PR.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What user or operator pain does this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Breaking change?
+      options:
+        - "No"
+        - "Yes — requires migration"
+        - "Unsure"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I understand deployable changes require admin multisig + verified wasm migration
+          required: true

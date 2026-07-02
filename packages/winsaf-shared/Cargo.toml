@@ -1,0 +1,24 @@
+[package]
+name = "winsaf-shared"
+description = "Shared types, constants and helpers for the WinSaf Safrochain CosmWasm contracts"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+
+[lib]
+# Pure library crate — not a contract, so no cdylib target and no entry points.
+crate-type = ["rlib"]
+
+[features]
+default = []
+
+[dependencies]
+cosmwasm-std = { workspace = true }
+cosmwasm-schema = { workspace = true }
+cw-utils = { workspace = true }
+thiserror = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }

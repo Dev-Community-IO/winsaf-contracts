@@ -1,0 +1,69 @@
+name: Bug report
+description: Report incorrect on-chain behavior, failed builds, or test failures
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve WinSaf contracts. **Do not report security vulnerabilities here** — use the [Security advisory form](https://github.com/Dev-Community-IO/winsaf-contracts/security/advisories/new) instead.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Lottery / rounds / tickets
+        - Treasury / fund split
+        - Referral
+        - Randomness / draw fairness
+        - Build / CI / tooling
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Contract version or git commit
+      placeholder: e.g. v0.1.0 or abc1234
+    validations:
+      required: true
+
+  - type: input
+    id: network
+    attributes:
+      label: Network (if on-chain)
+      placeholder: safro-testnet-1 / localnet / n/a
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: Clear steps or a minimal test case
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / tx hash / code_id
+      render: shell
+    validations:
+      required: false

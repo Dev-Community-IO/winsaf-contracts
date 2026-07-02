@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security advisory (private)
+    url: https://github.com/Dev-Community-IO/winsaf-contracts/security/advisories/new
+    about: Report vulnerabilities privately — do not open a public issue
+  - name: WinSaf product (private monorepo)
+    url: https://github.com/Dev-Community-IO/winsaf
+    about: Mini App, API, MPC service — not in this contracts repository

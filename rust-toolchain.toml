@@ -1,0 +1,8 @@
+# Pin the toolchain used to build the Safrochain CosmWasm contracts.
+# `stable` keeps us aligned with the cosmwasm/optimizer image (which builds on a
+# recent stable Rust). The wasm32 target is required to emit the contract Wasm.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

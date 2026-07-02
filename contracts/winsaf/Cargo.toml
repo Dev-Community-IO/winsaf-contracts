@@ -1,0 +1,57 @@
+# winsaf — the single, self-contained WinSaf lottery contract for Safrochain.
+#
+# This crate consolidates what used to be four separate contracts (lottery,
+# treasury, referral, randomness-beacon) into ONE contract with NO
+# inter-contract calls:
+#   - the treasury cut accrues in-contract (admin withdraws),
+#   - the referral cut credits an internal earnings ledger (referrer claims),
+#   - randomness is submitted internally by authorized submitters and consumed
+#     by the draw.
+#
+# ABI: pinned to the CosmWasm 2.x line (wasmvm 2.2.x / wasmd 0.54.1) via the
+# workspace dependency table.
+
+[package]
+name = "winsaf"
+description = "Self-contained WinSaf lottery contract (rounds, tickets, treasury, referral, randomness) for Safrochain"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+
+[lib]
+# cdylib -> the Wasm artifact loaded by the chain.
+# rlib   -> lets other crates (schema bin / integration tests) link natively.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `library` strips the exported `#[entry_point]`s so this crate can be imported
+# as a dependency without clashing Wasm exports. The optimizer build never
+# enables it.
+library = []
+
+[dependencies]
+cosmwasm-std = { workspace = true }
+cosmwasm-schema = { workspace = true }
+cw-storage-plus = { workspace = true }
+cw2 = { workspace = true }
+cw-utils = { workspace = true }
+thiserror = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+winsaf-shared = { workspace = true }
+
+# SHA-256: used to derive commit hashes and to verify drand randomness binding.
+# Pinned to the 0.10 line cosmwasm-crypto builds on for determinism.
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+cosmwasm-schema = { workspace = true }
+
+[[bin]]
+# `cargo run --bin schema` regenerates the JSON schema under ./schema.
+name = "schema"
+path = "src/bin/schema.rs"
+doc = false

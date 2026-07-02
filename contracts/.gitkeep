@@ -1,0 +1,13 @@
+# Deployable WinSaf contracts live here (one crate per directory), e.g.:
+#   contracts/lottery/            — ticket sales, draws, prize claims
+#   contracts/treasury/           — protocol treasury
+#   contracts/referral/           — referral reward accounting
+#   contracts/randomness-beacon/  — drand/nois beacon adapter (commit-reveal fallback)
+#
+# Each contract crate should:
+#   - depend on winsaf-shared via `{ workspace = true }`
+#   - declare `crate-type = ["cdylib", "rlib"]`
+#   - provide `src/bin/schema.rs` calling `cosmwasm_schema::write_api!`
+#
+# This placeholder keeps the (currently empty) directory tracked so the
+# `members = ["contracts/*"]` glob resolves and CI can find the folder.
