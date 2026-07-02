@@ -45,7 +45,7 @@ winsaf-shared = { workspace = true }
 
 # SHA-256: used to derive commit hashes and to verify drand randomness binding.
 # Pinned to the 0.10 line cosmwasm-crypto builds on for determinism.
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 cosmwasm-schema = { workspace = true }
