@@ -26,7 +26,7 @@ homepage = "https://winsaf.xyz"
 # Pinned to the 2.2 line to match Safrochain's wasmvm v2.2.4 (wasmd 0.54.1).
 # Build the deployable artifact with cosmwasm/optimizer:0.17.0 (matching optimizer).
 cosmwasm-std = { version = "~2.2", default-features = false, features = ["std", "iterator", "cosmwasm_2_2"] }
-cosmwasm-schema = "~2.2"
+cosmwasm-schema = "~3.0"
 cw-storage-plus = "^2.0"
 cw2 = "^2.0"
 cw-utils = "^2.0"
