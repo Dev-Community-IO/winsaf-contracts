@@ -1,0 +1,51 @@
+# WinSaf / Safrochain CosmWasm workspace
+#
+# VM: CosmWasm (Rust/Wasm) ONLY. There is NO EVM in Safrochain.
+# Target chain: wasmd 0.54.1 / wasmvm 2.2.4 / Cosmos SDK v0.50.
+# Because wasmvm 2.2.x pairs with the CosmWasm 2.1+ contract ABI, all contract
+# crates in this workspace pin cosmwasm-std / cosmwasm-schema to the 2.x line.
+
+[workspace]
+resolver = "2"
+members = [
+  "packages/*",
+  "contracts/winsaf",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+repository = "https://github.com/Dev-Community-IO/winsaf-contracts"
+homepage = "https://winsaf.xyz"
+
+# Shared dependency versions. Contract/package crates reference these with
+# `{ workspace = true }` so the whole tree stays on one consistent ABI.
+[workspace.dependencies]
+# Pinned to the 2.2 line to match Safrochain's wasmvm v2.2.4 (wasmd 0.54.1).
+# Build the deployable artifact with cosmwasm/optimizer:0.17.0 (matching optimizer).
+cosmwasm-std = { version = "~2.2", default-features = false, features = ["std", "iterator", "cosmwasm_2_2"] }
+cosmwasm-schema = "~2.2"
+cw-storage-plus = "^2.0"
+cw2 = "^2.0"
+cw-utils = "^2.0"
+thiserror = "^1"
+schemars = "0.8"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+
+# Internal crate — referenced by contracts as `{ workspace = true }`.
+winsaf-shared = { path = "packages/winsaf-shared" }
+
+# Release profile tuned for small, deterministic Wasm artifacts.
+# overflow-checks MUST stay on: silent wrap-around on token math is a fund loss.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+strip = true
+debug = false
+rpath = false
+incremental = false

@@ -1,0 +1,26 @@
+# Convenience aliases for local (non-Docker) Wasm builds and schema generation.
+#
+#   cargo wasm            -> build all contracts for wasm32-unknown-unknown (release)
+#   cargo wasm-debug      -> same, unoptimized (faster iteration, larger artifact)
+#   cargo unit-test       -> run the native unit-test suite with overflow checks
+#   cargo schema          -> (run from a contract crate) regenerate its JSON schema
+#
+# The canonical, reproducible artifacts are still produced by scripts/optimize.sh
+# via the cosmwasm/optimizer Docker image. These aliases are for fast dev loops.
+[alias]
+wasm = "build --release --lib --target wasm32-unknown-unknown"
+wasm-debug = "build --lib --target wasm32-unknown-unknown"
+unit-test = "test --lib"
+schema = "run --bin schema"
+
+[build]
+# Default host builds (unit tests, schema binaries) use the native target.
+# The `wasm` aliases override this via --target.
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  # Keep panic messages out of the Wasm to shrink the binary; the optimizer
+  # image applies the same treatment. Contracts should return ContractError,
+  # not panic, so this is safe.
+  "-C", "link-arg=-s",
+]

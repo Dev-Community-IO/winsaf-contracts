@@ -1,0 +1,21 @@
+# Rust / Cargo build output
+/target
+**/target
+
+# Optimizer output (regenerate via scripts/optimize.sh; verified by checksum)
+/artifacts
+
+# Cargo lockfile policy: commit for binaries/contracts (reproducible builds),
+# so it is intentionally NOT ignored here.
+
+# Local editor / OS cruft
+*.swp
+.DS_Store
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+credentials.env
+deployment-local.json
