@@ -241,8 +241,29 @@ pub enum QueryMsg {
     TreasuryBalance {},
 }
 
+/// Migration parameters. All fields are optional; a bare `{}` performs a plain
+/// version bump (the legacy behaviour). The fields let an admin rewrite config
+/// values that `SetConfig` cannot change — chiefly the number domain — during a
+/// code migration, so a live contract can adopt real parameters WITHOUT a fresh
+/// instantiate (preserving its address, pool and outstanding claims).
 #[cw_serde]
-pub struct MigrateMsg {}
+#[derive(Default)]
+pub struct MigrateMsg {
+    /// Overwrite `Config.number_max` (number-domain upper bound). Re-validates
+    /// the domain against the effective `numbers_per_ticket`.
+    pub number_max: Option<u8>,
+    /// Overwrite `Config.numbers_per_ticket`.
+    pub numbers_per_ticket: Option<u8>,
+    /// Overwrite `Config.draw_interval` (seconds). Only affects rounds opened
+    /// AFTER the migration — an already-open round keeps its fixed `closes_at`.
+    pub draw_interval: Option<u64>,
+    /// Overwrite `Config.max_dry_rounds` (0 disables the forced-rolldown cap).
+    pub max_dry_rounds: Option<u64>,
+    /// Reset the global "Must Be Won" dry streak to 0 (clears an inflated streak
+    /// accumulated before the empty/single-player-neutral fix).
+    #[serde(default)]
+    pub reset_dry_streak: bool,
+}
 
 // ===========================================================================
 // Response types
@@ -263,13 +284,17 @@ pub struct RoundResponse {
     pub winning_tickets: u64,
     /// Randomness state for this round, if any has been requested/delivered.
     pub randomness: Option<RandomnessRequest>,
-    /// Current global "Must Be Won" dry streak (consecutive settled rounds with
-    /// no jackpot winner that were not force-distributed). Lets the UI show
-    /// "must be won in K rounds" where `K = max_dry_rounds - dry_streak`.
+    /// "Must Be Won" dry streak: consecutive QUALIFYING rounds (>= 2 distinct
+    /// players) that settled with no jackpot winner and were not force-
+    /// distributed. Empty and single-player rounds are neutral and never advance
+    /// it. Lets the UI show "must be won in K rounds" where `K = max_dry_rounds -
+    /// dry_streak`.
+    ///
+    /// For a `Settled` round this is the streak AS OF that round (snapshotted at
+    /// draw); for the open/drawing round it is the live global streak.
     ///
     /// `#[serde(default)]` so responses/clients predating this field still
-    /// deserialize; it is populated on every round query from the global
-    /// `DRY_STREAK` item.
+    /// deserialize.
     #[serde(default)]
     pub dry_streak: u64,
 }

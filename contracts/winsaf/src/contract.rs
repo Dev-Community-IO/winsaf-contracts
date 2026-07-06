@@ -63,7 +63,8 @@ use crate::state::{
     default_max_dry_rounds, Config, PrizeTiers, RandomnessMode, RandomnessRequest,
     RandomnessStatus, Round, Ticket, VerifyMode, CANCEL_GRACE_SECONDS, CONFIG, CURRENT_ROUND,
     DEFAULT_REVEAL_TIMEOUT_SECONDS, DRAND_QUICKNET_GENESIS, DRAND_QUICKNET_PERIOD, DRY_STREAK,
-    MIN_REVEAL_DELAY_BLOCKS, PLAYERS, RANDOMNESS, REFERRAL_CODES, REFERRAL_EARNINGS,
+    MIN_PLAYERS_FOR_DRY_STREAK, MIN_REVEAL_DELAY_BLOCKS, PLAYERS, RANDOMNESS, REFERRAL_CODES,
+    REFERRAL_EARNINGS,
     REFERRAL_TOTALS, REFERRER, ROUNDS, TICKETS, TICKET_SEQ, TREASURY,
 };
 use crate::verify::{sha256, verify_drand, verify_mock, verify_reveal, G2_LEN};
@@ -975,9 +976,19 @@ fn execute_draw(
     // DOWN to the best-matching lower tier present, guaranteeing distribution.
     let jackpot_won = counts.six > 0;
     let dry_streak = DRY_STREAK.may_load(deps.storage)?.unwrap_or(0);
-    // Would settling this round WITHOUT a jackpot winner reach the cap?
-    let force =
-        !jackpot_won && config.max_dry_rounds > 0 && (dry_streak + 1) >= config.max_dry_rounds;
+    // A round only counts toward the dry streak once it has genuine competition:
+    // at least `MIN_PLAYERS_FOR_DRY_STREAK` distinct players. Empty rounds (which
+    // previously grew the streak past the cap without ever having a winner to roll
+    // down into) and single-player rounds (where the sole buyer would merely
+    // harvest their own rolled-over pool) are NEUTRAL — they neither advance nor
+    // reset the streak. This keeps the "Must Be Won" cap sound: it only counts
+    // real rounds, where the forced rolldown can always find a lower-tier winner.
+    let counts_toward_streak = round.player_count >= MIN_PLAYERS_FOR_DRY_STREAK;
+    // Would settling this qualifying round WITHOUT a jackpot winner reach the cap?
+    let force = counts_toward_streak
+        && !jackpot_won
+        && config.max_dry_rounds > 0
+        && (dry_streak + 1) >= config.max_dry_rounds;
 
     let mut forced_paid = false;
     let mut boost_tier: u8 = 0;
@@ -1087,16 +1098,26 @@ fn execute_draw(
     };
     // The pool retained on this round is exactly what claims can draw down.
     round.pool = distributed;
-    ROUNDS.save(deps.storage, round_id, &round)?;
 
-    // Update the "Must Be Won" dry streak: reset to 0 when the jackpot was won
-    // (naturally) or forced down to a lower tier; otherwise it grew by one.
+    // Update the "Must Be Won" dry streak:
+    //   - reset to 0 when the jackpot was won (naturally) or forced down to a
+    //     lower tier;
+    //   - grow by one on a qualifying (>= MIN_PLAYERS) dry round;
+    //   - leave UNCHANGED on empty / single-player rounds (neutral) so the cap
+    //     only ever counts rounds with real competition.
     let new_dry_streak = if jackpot_won || forced_paid {
         0
-    } else {
+    } else if counts_toward_streak {
         dry_streak + 1
+    } else {
+        dry_streak
     };
     DRY_STREAK.save(deps.storage, &new_dry_streak)?;
+
+    // Snapshot the streak onto the round so historical queries report the value
+    // as of this round, not the live global streak. Save the round AFTER this.
+    round.dry_streak_after = new_dry_streak;
+    ROUNDS.save(deps.storage, round_id, &round)?;
 
     // Open the next round (id + 1) seeded with any rollover.
     let next_id = open_next_round(
@@ -1117,6 +1138,7 @@ fn execute_draw(
         .add_attribute("distributed", distributed)
         .add_attribute("rollover", rollover_amount)
         .add_attribute("dry_streak", new_dry_streak.to_string())
+        .add_attribute("dry_streak_counted", counts_toward_streak.to_string())
         .add_attribute("rolldown", forced_paid.to_string())
         .add_attribute("next_round_id", next_id.to_string());
     if forced_paid {
@@ -1768,7 +1790,14 @@ fn query_round(deps: Deps, round_id: u64) -> Result<RoundResponse, ContractError
         .load(deps.storage, round_id)
         .map_err(|_| ContractError::RoundNotFound { round_id })?;
     let randomness = RANDOMNESS.may_load(deps.storage, round_id)?;
-    let dry_streak = DRY_STREAK.may_load(deps.storage)?.unwrap_or(0);
+    // For a Settled round report the streak snapshot taken at its draw; for a
+    // still open/drawing (or cancelled) round report the live global streak,
+    // which is what "must be won in K rounds" is measured against right now.
+    let dry_streak = if matches!(r.status, RoundStatus::Settled) {
+        r.dry_streak_after
+    } else {
+        DRY_STREAK.may_load(deps.storage)?.unwrap_or(0)
+    };
     Ok(RoundResponse {
         id: r.id,
         status: r.status,
@@ -1896,7 +1925,7 @@ fn query_treasury_balance(deps: Deps) -> Result<TreasuryBalanceResponse, Contrac
 // ===========================================================================
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
     let current = get_contract_version(deps.storage)?;
     if current.contract != CONTRACT_NAME {
         return Err(ContractError::InvalidMigration {
@@ -1904,21 +1933,61 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
             found: current.contract,
         });
     }
-    // Idempotent version bump. The security-hardening upgrade added fields to
-    // Config / Round / RandomnessRequest; all are `#[serde(default)]` so existing
-    // persisted state deserializes without an explicit data migration (defaults:
-    // reveal_timeout=0, open_code_registration=false, ticket_entropy=zero,
-    // committer/commit_height/reveal_deadline=None). The "Must Be Won" rolldown
-    // upgrade added `Config.max_dry_rounds` (serde default 5) and the
-    // `DRY_STREAK` item (absent → treated as 0 via `.may_load()?.unwrap_or(0)`),
-    // so both migrate without an explicit data step. The admin should `SetConfig`
-    // a non-zero `reveal_timeout` post-migration. Add data migrations here on
-    // future versions as needed.
+    // Serde-default field additions (Config / Round / RandomnessRequest across the
+    // security-hardening + rolldown upgrades) migrate WITHOUT an explicit data step
+    // (reveal_timeout=0, open_code_registration=false, ticket_entropy=zero,
+    // committer/commit_height/reveal_deadline=None, max_dry_rounds=5, DRY_STREAK
+    // absent→0, Round.dry_streak_after=0). The admin should `SetConfig` a non-zero
+    // `reveal_timeout` post-migration.
+    //
+    // Optional config rewrites: adopt parameters `SetConfig` cannot change — the
+    // number domain (`number_max` / `numbers_per_ticket`) chiefly — so a live
+    // contract can move to real params in place. Applied atomically with the same
+    // validation as instantiate.
+    let mut config = CONFIG.load(deps.storage)?;
+    let mut config_changed = false;
+    if let Some(nm) = msg.number_max {
+        config.number_max = nm;
+        config_changed = true;
+    }
+    if let Some(npt) = msg.numbers_per_ticket {
+        config.numbers_per_ticket = npt;
+        config_changed = true;
+    }
+    if msg.number_max.is_some() || msg.numbers_per_ticket.is_some() {
+        validate_number_domain(config.numbers_per_ticket, config.number_max)?;
+    }
+    if let Some(di) = msg.draw_interval {
+        if di == 0 {
+            return Err(ContractError::InvalidConfig {
+                reason: "draw_interval must be non-zero".to_string(),
+            });
+        }
+        config.draw_interval = di;
+        config_changed = true;
+    }
+    if let Some(mdr) = msg.max_dry_rounds {
+        config.max_dry_rounds = mdr;
+        config_changed = true;
+    }
+    if config_changed {
+        CONFIG.save(deps.storage, &config)?;
+    }
+
+    // Optionally clear an inflated "Must Be Won" streak (pre-fix empty rounds).
+    if msg.reset_dry_streak {
+        DRY_STREAK.save(deps.storage, &0u64)?;
+    }
+
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     Ok(Response::new().add_event(
         Event::new("winsaf/migrate")
             .add_attribute("from_version", current.version)
-            .add_attribute("to_version", CONTRACT_VERSION),
+            .add_attribute("to_version", CONTRACT_VERSION)
+            .add_attribute("config_rewritten", config_changed.to_string())
+            .add_attribute("number_max", config.number_max.to_string())
+            .add_attribute("draw_interval", config.draw_interval.to_string())
+            .add_attribute("dry_streak_reset", msg.reset_dry_streak.to_string()),
     ))
 }
 
@@ -3556,6 +3625,10 @@ mod tests {
         // FORCES the jackpot allocation down to the best present lower tier.
         let (mut deps, api, mut env, _admin, submitter) = setup_cap(3);
         let buyer = mk(&api, "buyer");
+        // Second player so each round reaches MIN_PLAYERS_FOR_DRY_STREAK and thus
+        // COUNTS toward the streak. Their ticket matches 0 (never wins), so it only
+        // bumps player_count without changing any tier's winner count.
+        let filler = mk(&api, "filler");
 
         // For each of 3 rounds: buy a ticket matching exactly 5 (never 6), so a
         // dry round always has a tier-5 winner to roll DOWN into.
@@ -3565,8 +3638,8 @@ mod tests {
             let round_id = (i + 1) as u64;
             let randomness = HexBinary::from(vec![*b; 32]);
             let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
-            let picks = picks_matching(&winning, 5);
-            buy(&mut deps, &env, &buyer, 1, Some(picks), None).unwrap();
+            buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&winning, 5)), None).unwrap();
+            buy(&mut deps, &env, &filler, 1, Some(picks_matching(&winning, 0)), None).unwrap();
             if round_id == 3 {
                 r1_pool_pre = round(&deps, 3).pool; // pre-draw pool of round 3
             }
@@ -3608,11 +3681,14 @@ mod tests {
         // (5) so no forced rolldown fires, then a jackpot win resets to 0.
         let (mut deps, api, mut env, _admin, submitter) = setup_cap(5);
         let buyer = mk(&api, "buyer");
+        // Filler player so every round counts toward the streak (>= 2 players).
+        let filler = mk(&api, "filler");
 
         // Round 1: dry (match 4 only) -> streak 1.
         let rnd1 = HexBinary::from(vec![0x41; 32]);
         let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
         buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w1, 4)), None).unwrap();
+        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w1, 0)), None).unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
         assert_eq!(round(&deps, 1).dry_streak, 1);
 
@@ -3620,6 +3696,7 @@ mod tests {
         let rnd2 = HexBinary::from(vec![0x42; 32]);
         let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
         buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 4)), None).unwrap();
+        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w2, 0)), None).unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
         assert_eq!(round(&deps, 2).dry_streak, 2);
 
@@ -3627,6 +3704,7 @@ mod tests {
         let rnd3 = HexBinary::from(vec![0x43; 32]);
         let w3 = derive_winning_numbers(rnd3.as_slice(), 6, 45);
         buy(&mut deps, &env, &buyer, 1, Some(w3.clone()), None).unwrap();
+        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w3, 0)), None).unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 3, rnd3);
         let r3 = round(&deps, 3);
         assert!(r3.prize_tiers.tier_6 > Uint128::zero()); // jackpot actually paid
@@ -3639,11 +3717,15 @@ mod tests {
         // winner, so it rolls over and the streak persists (reaches the cap).
         let (mut deps, api, mut env, _admin, submitter) = setup_cap(2);
         let buyer = mk(&api, "buyer");
+        // Filler player so the rounds count toward the streak (>= 2 players) even
+        // though neither player matches >= 3.
+        let filler = mk(&api, "filler");
 
         // Round 1: dry, no lower-tier winner (match 0) -> streak 1.
         let rnd1 = HexBinary::from(vec![0x51; 32]);
         let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
         buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w1, 0)), None).unwrap();
+        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w1, 0)), None).unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
         assert_eq!(round(&deps, 1).dry_streak, 1);
 
@@ -3651,6 +3733,7 @@ mod tests {
         let rnd2 = HexBinary::from(vec![0x52; 32]);
         let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
         buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 0)), None).unwrap();
+        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w2, 0)), None).unwrap();
         let pool_pre = round(&deps, 2).pool;
         run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
 
@@ -3698,6 +3781,69 @@ mod tests {
         // The boost really moved the jackpot allocation into tier 3 (not tier 6).
         assert_eq!(r1.prize_tiers.tier_6, Uint128::zero());
         assert!(tier6_alloc > Uint128::zero());
+    }
+
+    #[test]
+    fn dry_streak_neutral_on_empty_and_single_player_rounds() {
+        // Empty rounds and single-player rounds are NEUTRAL: they do not advance
+        // the "Must Be Won" streak. Only rounds with >= MIN_PLAYERS_FOR_DRY_STREAK
+        // distinct players count — so a long stretch of empty rounds can never
+        // exhaust the cap (the bug that let dry_streak grow to 132 with cap 5).
+        let (mut deps, api, mut env, _admin, submitter) = setup_cap(5);
+        let buyer = mk(&api, "buyer");
+        let filler = mk(&api, "filler");
+
+        // Round 1: EMPTY (no buys). Draw it — streak must stay 0.
+        let rnd1 = HexBinary::from(vec![0x71; 32]);
+        run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
+        assert_eq!(round(&deps, 1).dry_streak, 0, "empty round advanced the streak");
+
+        // Round 2: SINGLE player, dry (match 4 winner). Still neutral -> streak 0.
+        let rnd2 = HexBinary::from(vec![0x72; 32]);
+        let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 4)), None).unwrap();
+        run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
+        assert_eq!(round(&deps, 2).dry_streak, 0, "single-player round advanced the streak");
+
+        // Round 3: TWO players, dry -> now it counts -> streak 1.
+        let rnd3 = HexBinary::from(vec![0x73; 32]);
+        let w3 = derive_winning_numbers(rnd3.as_slice(), 6, 45);
+        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w3, 4)), None).unwrap();
+        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w3, 0)), None).unwrap();
+        run_draw_round(&mut deps, &mut env, &submitter, 3, rnd3);
+        assert_eq!(round(&deps, 3).dry_streak, 1);
+
+        // Round 4: EMPTY again -> streak held at 1 (not incremented, not reset).
+        let rnd4 = HexBinary::from(vec![0x74; 32]);
+        run_draw_round(&mut deps, &mut env, &submitter, 4, rnd4);
+        assert_eq!(round(&deps, 4).dry_streak, 1);
+        // Live global streak is also 1.
+        assert_eq!(current(&deps).dry_streak, 1);
+    }
+
+    #[test]
+    fn query_round_reports_historical_dry_streak_snapshot() {
+        // A settled round reports the streak AS OF its own draw, not the live
+        // global streak (which previously leaked into every historical query).
+        let (mut deps, api, mut env, _admin, submitter) = setup_cap(5);
+        let buyer = mk(&api, "buyer");
+        let filler = mk(&api, "filler");
+
+        // Two qualifying dry rounds: streak 1 then 2.
+        for (i, byte) in [0x81u8, 0x82u8].into_iter().enumerate() {
+            let round_id = (i + 1) as u64;
+            let rnd = HexBinary::from(vec![byte; 32]);
+            let w = derive_winning_numbers(rnd.as_slice(), 6, 45);
+            buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w, 4)), None).unwrap();
+            buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w, 0)), None).unwrap();
+            run_draw_round(&mut deps, &mut env, &submitter, round_id, rnd);
+        }
+
+        // Historical snapshots differ per round even though the live streak is 2.
+        assert_eq!(round(&deps, 1).dry_streak, 1);
+        assert_eq!(round(&deps, 2).dry_streak, 2);
+        // The open round (and live global) reflects the current streak.
+        assert_eq!(current(&deps).dry_streak, 2);
     }
 
     // --- claim --------------------------------------------------------------
@@ -4289,7 +4435,7 @@ mod tests {
     #[test]
     fn migrate_bumps_version() {
         let (mut deps, _api, env, _admin, _sub) = setup();
-        let res = migrate(deps.as_mut(), env, MigrateMsg {}).unwrap();
+        let res = migrate(deps.as_mut(), env, MigrateMsg::default()).unwrap();
         assert!(res.events.iter().any(|e| e.ty == "winsaf/migrate"));
         let v = get_contract_version(&deps.storage).unwrap();
         assert_eq!(v.contract, CONTRACT_NAME);
@@ -4300,8 +4446,53 @@ mod tests {
     fn migrate_wrong_contract_rejected() {
         let (mut deps, _api, _env, _admin, _sub) = setup();
         set_contract_version(deps.as_mut().storage, "crates.io:some-other", "0.1.0").unwrap();
-        let err = migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap_err();
+        let err = migrate(deps.as_mut(), mock_env(), MigrateMsg::default()).unwrap_err();
         assert!(matches!(err, ContractError::InvalidMigration { .. }));
+    }
+
+    #[test]
+    fn migrate_rewrites_number_domain_and_resets_dry_streak() {
+        // Simulate the in-place migration of the live contract: change the number
+        // domain (which SetConfig cannot) and clear an inflated dry streak.
+        let (mut deps, _api, env, _admin, _sub) = setup();
+        // Pretend a large streak accumulated pre-fix.
+        DRY_STREAK.save(deps.as_mut().storage, &132u64).unwrap();
+        let before = cfg(&deps);
+        assert_eq!(before.number_max, 45); // setup default
+
+        // Migrate from a 12-domain-like state to real params + reset streak.
+        // (Set number_max=12 first to prove the rewrite really moves it.)
+        let mut c = CONFIG.load(&deps.storage).unwrap();
+        c.number_max = 12;
+        CONFIG.save(deps.as_mut().storage, &c).unwrap();
+
+        let msg = MigrateMsg {
+            number_max: Some(45),
+            numbers_per_ticket: Some(6),
+            draw_interval: Some(300),
+            max_dry_rounds: Some(5),
+            reset_dry_streak: true,
+        };
+        migrate(deps.as_mut(), env, msg).unwrap();
+
+        let after = cfg(&deps);
+        assert_eq!(after.number_max, 45);
+        assert_eq!(after.numbers_per_ticket, 6);
+        assert_eq!(after.draw_interval, 300);
+        assert_eq!(after.max_dry_rounds, 5);
+        assert_eq!(DRY_STREAK.load(&deps.storage).unwrap(), 0);
+    }
+
+    #[test]
+    fn migrate_rejects_invalid_number_domain() {
+        // numbers_per_ticket must not exceed number_max — validated on migrate.
+        let (mut deps, _api, env, _admin, _sub) = setup();
+        let msg = MigrateMsg {
+            number_max: Some(4),
+            numbers_per_ticket: Some(6),
+            ..Default::default()
+        };
+        assert!(migrate(deps.as_mut(), env, msg).is_err());
     }
 
     // --- full lifecycle -----------------------------------------------------

@@ -48,6 +48,15 @@ pub const DEFAULT_REVEAL_TIMEOUT_SECONDS: u64 = 3600;
 /// fulfilled. The admin may cancel a stuck round without waiting for this.
 pub const CANCEL_GRACE_SECONDS: u64 = 86_400;
 
+/// Minimum number of DISTINCT players a round must have before it counts toward
+/// the "Must Be Won" dry streak. Rounds below this threshold (empty rounds, and
+/// single-player rounds where one buyer would merely harvest their own rolled-
+/// over pool) are NEUTRAL: they neither advance nor reset the streak. This keeps
+/// the forced-rolldown cap meaningful — it only counts rounds with genuine
+/// competition, where a lower-tier winner actually exists to roll the jackpot
+/// down into — instead of being exhausted by long stretches of empty rounds.
+pub const MIN_PLAYERS_FOR_DRY_STREAK: u64 = 2;
+
 /// drand quicknet beacon genesis time (unix seconds) — default when a drand
 /// contract does not override it. https://api.drand.sh/<quicknet>/info
 pub const DRAND_QUICKNET_GENESIS: u64 = 1_692_803_367;
@@ -251,6 +260,16 @@ pub struct Round {
     /// the field) still deserializes; it defaults to all-zero entropy.
     #[serde(default)]
     pub ticket_entropy: [u8; 32],
+    /// The global "Must Be Won" dry streak AS OF this round's settlement — the
+    /// value of [`DRY_STREAK`] immediately after this round was drawn. Persisted
+    /// so historical `Round`/`CurrentRound` queries can report the streak at that
+    /// round instead of the live global value (which otherwise makes every past
+    /// round appear to share the current streak).
+    ///
+    /// Only meaningful once the round is `Settled`; `0` for rounds that are still
+    /// open/drawing. `#[serde(default)]` so pre-upgrade rounds deserialize (0).
+    #[serde(default)]
+    pub dry_streak_after: u64,
 }
 
 impl Round {
@@ -275,6 +294,7 @@ impl Round {
             rolled_over_from,
             winning_tickets: 0,
             ticket_entropy: [0u8; 32],
+            dry_streak_after: 0,
         }
     }
 }

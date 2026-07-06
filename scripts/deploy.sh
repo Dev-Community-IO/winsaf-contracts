@@ -86,10 +86,22 @@ ok "stored — code_id=$CODE_ID (tx $HASH)"
 RMODE="${RANDOMNESS_MODE:-commit_reveal}"
 VMODE="${VERIFY_MODE:-bls}"
 SUBMITTER="${RANDOMNESS_SUBMITTER:-$SENDER}"
-say "── instantiating winsaf (5 SAF · 6·45 · 24h · 75/10/15 · randomness=${RMODE}) ──"
+# Gameplay params. REAL number domain (6 of 1..45 → C(45,6)=8,145,060 combos) so
+# odds are production-realistic, but a SHORT 5-min draw interval so testnet rounds
+# can be exercised quickly. Override any of these via env.
+DRAW_INTERVAL="${DRAW_INTERVAL:-300}"               # seconds/round (test cadence; prod = 86400)
+NUMBER_MAX="${NUMBER_MAX:-45}"                       # real domain upper bound
+NUMBERS_PER_TICKET="${NUMBERS_PER_TICKET:-6}"        # picks per ticket
+TICKET_PRICE_USAF="${TICKET_PRICE_USAF:-5000000}"    # 5 SAF
+MAX_DRY_ROUNDS="${MAX_DRY_ROUNDS:-5}"                # forced jackpot rolldown cap
+say "── instantiating winsaf (5 SAF · ${NUMBERS_PER_TICKET}·${NUMBER_MAX} · ${DRAW_INTERVAL}s · 75/10/15 · dry_cap=${MAX_DRY_ROUNDS} · randomness=${RMODE}) ──"
 INIT="$(jq -nc --arg a "$ADMIN" --arg s "$SUBMITTER" --arg m "$RMODE" --arg v "$VMODE" \
+  --argjson di "$DRAW_INTERVAL" --argjson nm "$NUMBER_MAX" --argjson npt "$NUMBERS_PER_TICKET" \
+  --arg tp "$TICKET_PRICE_USAF" --argjson mdr "$MAX_DRY_ROUNDS" \
   --arg dpk "${DRAND_PUBKEY:-}" --arg dch "${DRAND_CHAIN_HASH:-}" \
-  '{admin:$a, randomness_mode:$m, verify_mode:$v, authorized_submitters:[$s]}
+  '{admin:$a, randomness_mode:$m, verify_mode:$v, authorized_submitters:[$s],
+    draw_interval:$di, number_max:$nm, numbers_per_ticket:$npt,
+    ticket_price:{denom:"usaf", amount:$tp}, max_dry_rounds:$mdr}
    + (if $dpk != "" then {drand_pubkey:$dpk} else {} end)
    + (if $dch != "" then {drand_chain_hash:$dch} else {} end)')"
 RES="$(safrochaind tx wasm instantiate "$CODE_ID" "$INIT" --label "winsaf" --admin "$ADMIN" --from "$KEY_NAME" $KOPTS $TXFLAGS 2>"$ERRF")" \
