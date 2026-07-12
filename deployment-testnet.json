@@ -4,5 +4,5 @@
   "admin": "addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn",
   "contract": "addr_safro1aqkst3m7cvv9ku9nfcq8w3njl8w37fsjjff64kqmjfxvpht3gwnqqdveaq",
   "codeId": 156,
-  "note": "In-place MIGRATE of the live winsaf contract from code 146 → 156: real number domain (6 of 1..45), draw_interval=300 (5min test cadence), max_dry_rounds=5, dry_streak reset. Dry-streak now only counts rounds with >=2 players; Round.dry_streak_after snapshots per-round. Address/pool/claims preserved."
+  "note": "In-place MIGRATE of the live winsaf contract from code 146 → 156: real number domain (6 of 1..45), draw_interval was 300 (5min test cadence) then SetConfig → 86400 (24h) on 2026-07-12 (tx B6F9FF19…), max_dry_rounds=5, dry_streak reset. Dry-streak now only counts rounds with >=2 players; Round.dry_streak_after snapshots per-round. Address/pool/claims preserved."
 }
