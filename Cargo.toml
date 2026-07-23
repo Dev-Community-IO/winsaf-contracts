@@ -30,7 +30,7 @@ cosmwasm-schema = "~2.2"
 cw-storage-plus = "^2.0"
 cw2 = "^2.0"
 cw-utils = "^2.0"
-thiserror = "^1"
+thiserror = "^2"
 schemars = "0.8"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 
