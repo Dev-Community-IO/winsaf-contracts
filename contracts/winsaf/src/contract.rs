@@ -78,7 +78,7 @@ pub const CONTRACT_NAME: &str = "crates.io:winsaf";
 pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Max tickets buyable in a single transaction (bounds gas / loop size).
-const MAX_TICKETS_PER_TX: u32 = 100;
+const MAX_TICKETS_PER_TX: u32 = 1000;
 /// Hard per-round ticket cap so `Draw` / `CancelRound` stay within block gas.
 /// Tuned for Safrochain; raise only with paginated settle.
 const MAX_TICKETS_PER_ROUND: u64 = 10_000;
