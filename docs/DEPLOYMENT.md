@@ -82,3 +82,11 @@ Always verify the new artifact checksum before migrating. Prefer timelock + mult
 ## Mainnet
 
 `deploy.sh` **blocks mainnet** unless `WINSAF_ALLOW_MAINNET=iunderstand` is set. Complete audit + governance checklist before mainnet.
+
+`instantiate` always opens **round 1**. If you are not ready for public play:
+
+1. Store + instantiate.
+2. Immediately `Pause {}` as contract admin (buys/grants blocked).
+3. Leave `MAINNET_KEEPER_ENABLED=false` until you Unpause.
+4. Fill `config/chains/mainnet.json`, `deployment-mainnet.json`, and `MAINNET_CONTRACT_*` / `VITE_MAINNET_CONTRACT_WINSAF`.
+5. Flip `DEFAULT_SETTLEMENT_NETWORK=mainnet` only after `indexer-mainnet` is caught up.

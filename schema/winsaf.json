@@ -1,0 +1,2476 @@
+{
+  "contract_name": "winsaf",
+  "contract_version": "0.1.0",
+  "idl_version": "1.0.0",
+  "instantiate": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "InstantiateMsg",
+    "description": "Instantiate parameters. Every `Option` has a sane default (see the field docs); the deploy script relies on this exact layout.",
+    "type": "object",
+    "properties": {
+      "admin": {
+        "description": "Admin address. `None` → the instantiator (`info.sender`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "authorized_submitters": {
+        "description": "Randomness submitters (relayer / keeper). Defaults to empty (admin-only).",
+        "default": [],
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "denom": {
+        "description": "Base denom. `None` → `\"usaf\"`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "drand_chain_hash": {
+        "description": "drand chain hash — required for drand.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "drand_genesis_time": {
+        "description": "drand beacon genesis time (unix seconds). `None` → drand quicknet default (1692803367). Only meaningful in drand mode.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "drand_period": {
+        "description": "drand beacon period (seconds). `None` → drand quicknet default (3).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "drand_pubkey": {
+        "description": "drand group public key — required for drand + bls.",
+        "anyOf": [
+          {
+            "$ref": "#/definitions/HexBinary"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "draw_interval": {
+        "description": "Round duration in seconds. `None` → 86400 (24h).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "max_dry_rounds": {
+        "description": "\"Must Be Won\" cap: max consecutive dry rounds before a forced jackpot rolldown to the best present lower tier. `None` → 5. `0` disables it.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "min_claim_usaf": {
+        "description": "Referral claim floor (usaf). `None` → 0 (no floor).",
+        "anyOf": [
+          {
+            "$ref": "#/definitions/Uint128"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "number_max": {
+        "description": "Number domain upper bound. `None` → 45.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "numbers_per_ticket": {
+        "description": "Numbers per ticket. `None` → 6.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "open_code_registration": {
+        "description": "Allow permissionless `RegisterCode`. `None`/`false` → admin-only code registration (prevents referral-code squatting).",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "randomness_mode": {
+        "description": "Randomness mechanism. `None` → `Drand` in production builds, `Mock` with the `dev-randomness` feature.",
+        "anyOf": [
+          {
+            "$ref": "#/definitions/RandomnessMode"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "reveal_timeout": {
+        "description": "Commit-reveal reveal timeout (seconds). `None` → 3600.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "rollover_on_no_winner": {
+        "description": "Rollover leftover pool to next round on no jackpot winner. `None` → true.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "split": {
+        "description": "Revenue split. `None` → 7500/1000/1500 (must sum to 10000).",
+        "anyOf": [
+          {
+            "$ref": "#/definitions/FundSplitBps"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ticket_price": {
+        "description": "Ticket price. `None` → 5_000_000 usaf. Denom must equal `denom`.",
+        "anyOf": [
+          {
+            "$ref": "#/definitions/Coin"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "verify_mode": {
+        "description": "drand verification strategy. `None` → `Bls` in production builds, `Dev` with the `dev-randomness` feature.",
+        "anyOf": [
+          {
+            "$ref": "#/definitions/VerifyMode"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "additionalProperties": false,
+    "definitions": {
+      "Coin": {
+        "type": "object",
+        "required": [
+          "amount",
+          "denom"
+        ],
+        "properties": {
+          "amount": {
+            "$ref": "#/definitions/Uint128"
+          },
+          "denom": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FundSplitBps": {
+        "description": "Revenue split in basis points. Invariant: `prize + referral + treasury == 10000`.",
+        "type": "object",
+        "required": [
+          "prize_bps",
+          "referral_bps",
+          "treasury_bps"
+        ],
+        "properties": {
+          "prize_bps": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          },
+          "referral_bps": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          },
+          "treasury_bps": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HexBinary": {
+        "description": "This is a wrapper around Vec<u8> to add hex de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is similar to `cosmwasm_std::Binary` but uses hex. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+        "type": "string"
+      },
+      "RandomnessMode": {
+        "description": "Which randomness mechanism this contract operates.",
+        "oneOf": [
+          {
+            "description": "External drand beacon delivered by an authorized relayer.",
+            "type": "string",
+            "enum": [
+              "drand"
+            ]
+          },
+          {
+            "description": "On-chain commit-reveal fallback.",
+            "type": "string",
+            "enum": [
+              "commit_reveal"
+            ]
+          },
+          {
+            "description": "Localnet mock: any authorized submitter can push randomness with no crypto verification. NEVER for mainnet.",
+            "type": "string",
+            "enum": [
+              "mock"
+            ]
+          }
+        ]
+      },
+      "Uint128": {
+        "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+        "type": "string"
+      },
+      "VerifyMode": {
+        "description": "How delivered drand randomness is verified before it is accepted.",
+        "oneOf": [
+          {
+            "description": "Full drand BLS verification against `drand_pubkey` + `drand_chain_hash`. The ONLY mode that should be used on mainnet with `RandomnessMode::Drand`.",
+            "type": "string",
+            "enum": [
+              "bls"
+            ]
+          },
+          {
+            "description": "Development verifier: structural checks only (length, randomness == sha256(sig)) — NO BLS pairing check. Gated behind config so it can never be silently active in production.",
+            "type": "string",
+            "enum": [
+              "dev"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "execute": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ExecuteMsg",
+    "oneOf": [
+      {
+        "description": "Buy `count` tickets for the current open round. Must send exactly `count * ticket_price` in `denom`. `numbers` (when provided) sets the picks for the FIRST ticket; remaining tickets (and all tickets when omitted) are quick-picked. `referral_code` binds/uses a referral code.",
+        "type": "object",
+        "required": [
+          "buy_tickets"
+        ],
+        "properties": {
+          "buy_tickets": {
+            "type": "object",
+            "required": [
+              "count"
+            ],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0.0
+              },
+              "numbers": {
+                "description": "Explicit picks for the first ticket; `None` = quick-pick all.",
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "integer",
+                  "format": "uint8",
+                  "minimum": 0.0
+                }
+              },
+              "referral_code": {
+                "description": "Optional referral code identifying the buyer's referrer.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Authorized-submitter-or-admin only: mint `count` operator-sponsored bonus tickets OWNED BY `owner`, flagged free, into the current open round. Backs an off-chain \"redeem XP for a free ticket\" feature. The caller MUST attach exactly `count * ticket_price` in `denom` (the operator sponsors the pool contribution so the user pays nothing); the full amount is added to the round pool so the granted tickets are honestly funded and can win / be claimed by `owner` like any paid ticket. `numbers` (when provided) sets the picks for the FIRST ticket; remaining tickets (and all when omitted) are quick-picked — exactly like `BuyTickets`.",
+        "type": "object",
+        "required": [
+          "grant_bonus_ticket"
+        ],
+        "properties": {
+          "grant_bonus_ticket": {
+            "type": "object",
+            "required": [
+              "count",
+              "owner"
+            ],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0.0
+              },
+              "numbers": {
+                "description": "Explicit picks for the first ticket; `None` = quick-pick all.",
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "integer",
+                  "format": "uint8",
+                  "minimum": 0.0
+                }
+              },
+              "owner": {
+                "description": "Beneficiary who OWNS the minted bonus tickets.",
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Admin-only: mint `count` bonus tickets OWNED BY `owner`, flagged free, into the current open round, funded from the in-contract TREASURY balance (NOT from attached funds). Backs the \"redeem XP for a free ticket\" feature without any external SAF float: the caller sends NO funds, `count * ticket_price` is debited from the treasury and added to the round pool so the granted tickets are honestly funded and can win / be claimed by `owner` like any paid ticket. Fails with `InsufficientTreasury` if the treasury cannot cover the grant. Rejected while the contract is paused. `numbers` (when provided) sets the picks for the FIRST ticket; the rest are quick-picked — exactly like `GrantBonusTicket`.",
+        "type": "object",
+        "required": [
+          "grant_bonus_ticket_from_treasury"
+        ],
+        "properties": {
+          "grant_bonus_ticket_from_treasury": {
+            "type": "object",
+            "required": [
+              "count",
+              "owner"
+            ],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0.0
+              },
+              "numbers": {
+                "description": "Explicit picks for the first ticket; `None` = quick-pick all.",
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "integer",
+                  "format": "uint8",
+                  "minimum": 0.0
+                }
+              },
+              "owner": {
+                "description": "Beneficiary who OWNS the minted bonus tickets.",
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Permissionless: close the current round once `closes_at` has passed. Transitions `Open → Drawing`.",
+        "type": "object",
+        "required": [
+          "close_round"
+        ],
+        "properties": {
+          "close_round": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Authorized-submitter-only: deliver randomness for a closed round and (once verified per mode) mark it fulfilled so it can be drawn.",
+        "type": "object",
+        "required": [
+          "submit_randomness"
+        ],
+        "properties": {
+          "submit_randomness": {
+            "type": "object",
+            "required": [
+              "randomness",
+              "round_id"
+            ],
+            "properties": {
+              "randomness": {
+                "description": "32-byte beacon output (hex).",
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/HexBinary"
+                  }
+                ]
+              },
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "signature": {
+                "description": "drand/nois BLS signature (verified in drand mode; ignored in mock).",
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/HexBinary"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Commit-reveal mode only — step 1. An authorized submitter commits to `sha256(value)` for a closed round without revealing `value`.",
+        "type": "object",
+        "required": [
+          "commit_randomness"
+        ],
+        "properties": {
+          "commit_randomness": {
+            "type": "object",
+            "required": [
+              "commitment",
+              "round_id"
+            ],
+            "properties": {
+              "commitment": {
+                "$ref": "#/definitions/HexBinary"
+              },
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Commit-reveal mode only — step 2. Reveal the pre-image `value`; the contract checks `sha256(value) == commitment` then fulfils the round.",
+        "type": "object",
+        "required": [
+          "reveal_randomness"
+        ],
+        "properties": {
+          "reveal_randomness": {
+            "type": "object",
+            "required": [
+              "round_id",
+              "value"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "value": {
+                "$ref": "#/definitions/HexBinary"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Compute matches per ticket, fix per-tier prizes from the pool, mark winners and finalize. Consumes the round's fulfilled randomness. If no jackpot winner and rollover is enabled the leftover pool moves to the next round. Transitions `Drawing → Settled` and opens the next round.",
+        "type": "object",
+        "required": [
+          "draw"
+        ],
+        "properties": {
+          "draw": {
+            "type": "object",
+            "required": [
+              "round_id"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Recover a stuck `Drawing` round whose randomness never fulfilled. Admin may call at any time; anyone may call once `closes_at + CANCEL_GRACE_SECONDS` has passed (or, in commit-reveal, once the commitment's `reveal_deadline` has passed). Marks the round `Cancelled`, converts the retained pool into pro-rata pull-refunds for ticket buyers (claimed via `ClaimReward`), and opens the next round so the lifecycle is never permanently blocked.",
+        "type": "object",
+        "required": [
+          "cancel_round"
+        ],
+        "properties": {
+          "cancel_round": {
+            "type": "object",
+            "required": [
+              "round_id"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Pull-based prize payout (or, for a `Cancelled` round, the buyer's pro-rata refund). Only the ticket owner may claim, only if the assigned amount is non-zero and not yet claimed.",
+        "type": "object",
+        "required": [
+          "claim_reward"
+        ],
+        "properties": {
+          "claim_reward": {
+            "type": "object",
+            "required": [
+              "round_id",
+              "ticket_id"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "ticket_id": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Bind the caller (referee) to a referrer, once and immutably. Provide a `referrer` address and/or a `code` that resolves to one. Self-referral is rejected.",
+        "type": "object",
+        "required": [
+          "bind_referrer"
+        ],
+        "properties": {
+          "bind_referrer": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "referrer": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Register a unique, case-insensitive referral `code` for the caller.",
+        "type": "object",
+        "required": [
+          "register_code"
+        ],
+        "properties": {
+          "register_code": {
+            "type": "object",
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Referrer pulls their accrued, unclaimed earnings (subject to `min_claim_usaf`). Sends the full pending balance.",
+        "type": "object",
+        "required": [
+          "claim_referral"
+        ],
+        "properties": {
+          "claim_referral": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Admin-only: move `amount` usaf from the tracked treasury balance to `to`.",
+        "type": "object",
+        "required": [
+          "withdraw_treasury"
+        ],
+        "properties": {
+          "withdraw_treasury": {
+            "type": "object",
+            "required": [
+              "amount",
+              "to"
+            ],
+            "properties": {
+              "amount": {
+                "$ref": "#/definitions/Uint128"
+              },
+              "to": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Admin-only: seed a round's prize pool without minting tickets. Caller attaches a non-zero amount of `denom`. If `round_id` is the current Open round, funds are added to `round.pool` immediately. If `round_id` is a future round (not yet opened), funds are escrowed and folded into that round's pool when it opens. Rejected for Drawing/Settled/Cancelled or past round ids. Tier BPS at draw are unchanged; absolute prizes scale.",
+        "type": "object",
+        "required": [
+          "top_up_pool"
+        ],
+        "properties": {
+          "top_up_pool": {
+            "type": "object",
+            "required": [
+              "round_id"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Admin-only: refund escrowed `TopUpPool` funds for a future (not yet opened) round back to the admin. No-op amount fails if nothing pending.",
+        "type": "object",
+        "required": [
+          "cancel_pending_top_up"
+        ],
+        "properties": {
+          "cancel_pending_top_up": {
+            "type": "object",
+            "required": [
+              "round_id"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Admin-only: update mutable config fields (any `None` field is unchanged).",
+        "type": "object",
+        "required": [
+          "set_config"
+        ],
+        "properties": {
+          "set_config": {
+            "type": "object",
+            "properties": {
+              "add_submitters": {
+                "description": "Submitters to ADD to the authorized set.",
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
+              "admin": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "drand_chain_hash": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "drand_genesis_time": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "drand_period": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "drand_pubkey": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/HexBinary"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "draw_interval": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "max_dry_rounds": {
+                "description": "\"Must Be Won\" cap: max consecutive dry rounds before a forced jackpot rolldown. `0` disables the feature.",
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "min_claim_usaf": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/Uint128"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "open_code_registration": {
+                "description": "Toggle permissionless referral-code registration.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "randomness_mode": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/RandomnessMode"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "remove_submitters": {
+                "description": "Submitters to REMOVE from the authorized set.",
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
+              "reveal_timeout": {
+                "description": "Commit-reveal reveal timeout (seconds).",
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "rollover_on_no_winner": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "split": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/FundSplitBps"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ticket_price": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/Coin"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "verify_mode": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/VerifyMode"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Admin-only kill switch (blocks buys).",
+        "type": "object",
+        "required": [
+          "pause"
+        ],
+        "properties": {
+          "pause": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Admin-only resume.",
+        "type": "object",
+        "required": [
+          "unpause"
+        ],
+        "properties": {
+          "unpause": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    ],
+    "definitions": {
+      "Coin": {
+        "type": "object",
+        "required": [
+          "amount",
+          "denom"
+        ],
+        "properties": {
+          "amount": {
+            "$ref": "#/definitions/Uint128"
+          },
+          "denom": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FundSplitBps": {
+        "description": "Revenue split in basis points. Invariant: `prize + referral + treasury == 10000`.",
+        "type": "object",
+        "required": [
+          "prize_bps",
+          "referral_bps",
+          "treasury_bps"
+        ],
+        "properties": {
+          "prize_bps": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          },
+          "referral_bps": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          },
+          "treasury_bps": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HexBinary": {
+        "description": "This is a wrapper around Vec<u8> to add hex de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is similar to `cosmwasm_std::Binary` but uses hex. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+        "type": "string"
+      },
+      "RandomnessMode": {
+        "description": "Which randomness mechanism this contract operates.",
+        "oneOf": [
+          {
+            "description": "External drand beacon delivered by an authorized relayer.",
+            "type": "string",
+            "enum": [
+              "drand"
+            ]
+          },
+          {
+            "description": "On-chain commit-reveal fallback.",
+            "type": "string",
+            "enum": [
+              "commit_reveal"
+            ]
+          },
+          {
+            "description": "Localnet mock: any authorized submitter can push randomness with no crypto verification. NEVER for mainnet.",
+            "type": "string",
+            "enum": [
+              "mock"
+            ]
+          }
+        ]
+      },
+      "Uint128": {
+        "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+        "type": "string"
+      },
+      "VerifyMode": {
+        "description": "How delivered drand randomness is verified before it is accepted.",
+        "oneOf": [
+          {
+            "description": "Full drand BLS verification against `drand_pubkey` + `drand_chain_hash`. The ONLY mode that should be used on mainnet with `RandomnessMode::Drand`.",
+            "type": "string",
+            "enum": [
+              "bls"
+            ]
+          },
+          {
+            "description": "Development verifier: structural checks only (length, randomness == sha256(sig)) — NO BLS pairing check. Gated behind config so it can never be silently active in production.",
+            "type": "string",
+            "enum": [
+              "dev"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "query": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "QueryMsg",
+    "oneOf": [
+      {
+        "description": "Current protocol config.",
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "properties": {
+          "config": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "The round currently accepting tickets.",
+        "type": "object",
+        "required": [
+          "current_round"
+        ],
+        "properties": {
+          "current_round": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "A specific round by id.",
+        "type": "object",
+        "required": [
+          "round"
+        ],
+        "properties": {
+          "round": {
+            "type": "object",
+            "required": [
+              "round_id"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Paginated tickets for a round, optionally filtered by owner.",
+        "type": "object",
+        "required": [
+          "tickets"
+        ],
+        "properties": {
+          "tickets": {
+            "type": "object",
+            "required": [
+              "round_id"
+            ],
+            "properties": {
+              "limit": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint32",
+                "minimum": 0.0
+              },
+              "owner": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              },
+              "start_after": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Total prize owed to `owner` across their tickets in a round, split into claimable (unclaimed) and already-claimed totals.",
+        "type": "object",
+        "required": [
+          "prize"
+        ],
+        "properties": {
+          "prize": {
+            "type": "object",
+            "required": [
+              "owner",
+              "round_id"
+            ],
+            "properties": {
+              "owner": {
+                "type": "string"
+              },
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "The referrer a referee is bound to (if any).",
+        "type": "object",
+        "required": [
+          "referrer"
+        ],
+        "properties": {
+          "referrer": {
+            "type": "object",
+            "required": [
+              "referee"
+            ],
+            "properties": {
+              "referee": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Full referrer summary: pending + lifetime aggregates.",
+        "type": "object",
+        "required": [
+          "referral_summary"
+        ],
+        "properties": {
+          "referral_summary": {
+            "type": "object",
+            "required": [
+              "addr"
+            ],
+            "properties": {
+              "addr": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "The in-contract treasury balance (usaf).",
+        "type": "object",
+        "required": [
+          "treasury_balance"
+        ],
+        "properties": {
+          "treasury_balance": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Escrowed promotional seed for a round that has not opened yet.",
+        "type": "object",
+        "required": [
+          "pending_top_up"
+        ],
+        "properties": {
+          "pending_top_up": {
+            "type": "object",
+            "required": [
+              "round_id"
+            ],
+            "properties": {
+              "round_id": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    ]
+  },
+  "migrate": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "MigrateMsg",
+    "description": "Migration parameters. All fields are optional; a bare `{}` performs a plain version bump (the legacy behaviour). The fields let an admin rewrite config values that `SetConfig` cannot change — chiefly the number domain — during a code migration, so a live contract can adopt real parameters WITHOUT a fresh instantiate (preserving its address, pool and outstanding claims).",
+    "type": "object",
+    "properties": {
+      "draw_interval": {
+        "description": "Overwrite `Config.draw_interval` (seconds). Only affects rounds opened AFTER the migration — an already-open round keeps its fixed `closes_at`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "max_dry_rounds": {
+        "description": "Overwrite `Config.max_dry_rounds` (0 disables the forced-rolldown cap).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "number_max": {
+        "description": "Overwrite `Config.number_max` (number-domain upper bound). Re-validates the domain against the effective `numbers_per_ticket`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "numbers_per_ticket": {
+        "description": "Overwrite `Config.numbers_per_ticket`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "reset_dry_streak": {
+        "description": "Reset the global \"Must Be Won\" dry streak to 0 (clears an inflated streak accumulated before the empty/single-player-neutral fix).",
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": false
+  },
+  "sudo": null,
+  "responses": {
+    "config": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "Config",
+      "description": "Protocol configuration and privileged roles. Mutable by `admin` via `SetConfig`. Consolidates config from all four former contracts.",
+      "type": "object",
+      "required": [
+        "admin",
+        "authorized_submitters",
+        "denom",
+        "drand_chain_hash",
+        "drand_pubkey",
+        "draw_interval",
+        "min_claim_usaf",
+        "number_max",
+        "numbers_per_ticket",
+        "paused",
+        "randomness_mode",
+        "rollover_on_no_winner",
+        "split",
+        "ticket_price",
+        "verify_mode"
+      ],
+      "properties": {
+        "admin": {
+          "description": "Address allowed to change config, pause/unpause, withdraw treasury and manage submitters.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Addr"
+            }
+          ]
+        },
+        "authorized_submitters": {
+          "description": "Addresses permitted to submit randomness / commit / reveal. The admin is always implicitly authorized.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Addr"
+          }
+        },
+        "denom": {
+          "description": "Base micro-denom everything is accounted and paid in (`usaf`).",
+          "type": "string"
+        },
+        "drand_chain_hash": {
+          "description": "drand chain hash — identifies the beacon chain the pubkey belongs to.",
+          "type": "string"
+        },
+        "drand_genesis_time": {
+          "description": "drand beacon genesis time (unix seconds). Used to derive the beacon round bound to a round's `closes_at`, so the beacon a draw consumes is the FIRST drand round published strictly AFTER close — unknowable at buy/close time (quicknet: 1692803367). Zero in non-drand modes.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "drand_period": {
+          "description": "drand beacon period in seconds (quicknet: 3). Zero in non-drand modes.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "drand_pubkey": {
+          "description": "drand group public key (BLS12-381 G1, 48 bytes). Empty unless drand+bls.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HexBinary"
+            }
+          ]
+        },
+        "draw_interval": {
+          "description": "Seconds a round stays open before it may be closed (`opens_at + interval`).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_dry_rounds": {
+          "description": "\"Must Be Won\" cap: the maximum number of consecutive dry rounds (no match-6 jackpot winner) the jackpot allocation may roll over before it is FORCED to roll DOWN to the best-matching lower tier present, guaranteeing distribution. `0` disables the feature (unlimited rollover — the legacy behaviour). Default 5.\n\n`#[serde(default = \"default_max_dry_rounds\")]` so a Config persisted by a pre-upgrade code version (which lacked this field) still deserializes across a code migration, defaulting to 5.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "min_claim_usaf": {
+          "description": "Minimum accrued earnings (usaf) a referrer must hold before `ClaimReferral`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "number_max": {
+          "description": "Inclusive upper bound of the number domain `1..=number_max` (default 45).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "numbers_per_ticket": {
+          "description": "How many distinct numbers each ticket picks (default 6).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "open_code_registration": {
+          "description": "When `false` (default), `RegisterCode` is admin-only so reserved brand/influencer referral codes cannot be squatted. When `true`, anyone may register an unused code (legacy permissionless behaviour).\n\n`#[serde(default)]` for backward-compatible migration (defaults to the safe closed/admin-only behaviour on upgrade).",
+          "default": false,
+          "type": "boolean"
+        },
+        "paused": {
+          "description": "Global kill-switch: when true, ticket sales are blocked.",
+          "type": "boolean"
+        },
+        "randomness_mode": {
+          "description": "Randomness mechanism (mock / drand / commit-reveal).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RandomnessMode"
+            }
+          ]
+        },
+        "reveal_timeout": {
+          "description": "Seconds after a commit-reveal commitment lands before the round may be cancelled/recovered when the reveal never arrives. Also gates the minimum reveal delay window together with [`MIN_REVEAL_DELAY_BLOCKS`]. Default 3600.\n\n`#[serde(default)]` so a Config persisted by a pre-upgrade code version (which lacked this field) still deserializes across a code migration; the admin can then set a non-zero value via `SetConfig`.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "rollover_on_no_winner": {
+          "description": "If true and a round has no jackpot winner, its leftover prize pool rolls into the next round instead of being retained.",
+          "type": "boolean"
+        },
+        "split": {
+          "description": "Revenue split in bps (prize / referral / treasury), sums to 10_000.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FundSplitBps"
+            }
+          ]
+        },
+        "ticket_price": {
+          "description": "Fixed ticket price. Denom must equal `denom`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Coin"
+            }
+          ]
+        },
+        "verify_mode": {
+          "description": "How drand randomness is verified (bls / dev).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VerifyMode"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Addr": {
+          "description": "A human readable address.\n\nIn Cosmos, this is typically bech32 encoded. But for multi-chain smart contracts no assumptions should be made other than being UTF-8 encoded and of reasonable length.\n\nThis type represents a validated address. It can be created in the following ways 1. Use `Addr::unchecked(input)` 2. Use `let checked: Addr = deps.api.addr_validate(input)?` 3. Use `let checked: Addr = deps.api.addr_humanize(canonical_addr)?` 4. Deserialize from JSON. This must only be done from JSON that was validated before such as a contract's state. `Addr` must not be used in messages sent by the user because this would result in unvalidated instances.\n\nThis type is immutable. If you really need to mutate it (Really? Are you sure?), create a mutable copy using `let mut mutable = Addr::to_string()` and operate on that `String` instance.",
+          "type": "string"
+        },
+        "Coin": {
+          "type": "object",
+          "required": [
+            "amount",
+            "denom"
+          ],
+          "properties": {
+            "amount": {
+              "$ref": "#/definitions/Uint128"
+            },
+            "denom": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "FundSplitBps": {
+          "description": "Revenue split in basis points. Invariant: `prize + referral + treasury == 10000`.",
+          "type": "object",
+          "required": [
+            "prize_bps",
+            "referral_bps",
+            "treasury_bps"
+          ],
+          "properties": {
+            "prize_bps": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "referral_bps": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "treasury_bps": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        "HexBinary": {
+          "description": "This is a wrapper around Vec<u8> to add hex de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is similar to `cosmwasm_std::Binary` but uses hex. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+          "type": "string"
+        },
+        "RandomnessMode": {
+          "description": "Which randomness mechanism this contract operates.",
+          "oneOf": [
+            {
+              "description": "External drand beacon delivered by an authorized relayer.",
+              "type": "string",
+              "enum": [
+                "drand"
+              ]
+            },
+            {
+              "description": "On-chain commit-reveal fallback.",
+              "type": "string",
+              "enum": [
+                "commit_reveal"
+              ]
+            },
+            {
+              "description": "Localnet mock: any authorized submitter can push randomness with no crypto verification. NEVER for mainnet.",
+              "type": "string",
+              "enum": [
+                "mock"
+              ]
+            }
+          ]
+        },
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        },
+        "VerifyMode": {
+          "description": "How delivered drand randomness is verified before it is accepted.",
+          "oneOf": [
+            {
+              "description": "Full drand BLS verification against `drand_pubkey` + `drand_chain_hash`. The ONLY mode that should be used on mainnet with `RandomnessMode::Drand`.",
+              "type": "string",
+              "enum": [
+                "bls"
+              ]
+            },
+            {
+              "description": "Development verifier: structural checks only (length, randomness == sha256(sig)) — NO BLS pairing check. Gated behind config so it can never be silently active in production.",
+              "type": "string",
+              "enum": [
+                "dev"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "current_round": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RoundResponse",
+      "type": "object",
+      "required": [
+        "closes_at",
+        "id",
+        "opens_at",
+        "player_count",
+        "pool",
+        "prize_tiers",
+        "status",
+        "ticket_count",
+        "winning_tickets"
+      ],
+      "properties": {
+        "closes_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "dry_streak": {
+          "description": "\"Must Be Won\" dry streak: consecutive QUALIFYING rounds (>= 2 distinct players) that settled with no jackpot winner and were not force- distributed. Empty and single-player rounds are neutral and never advance it. Lets the UI show \"must be won in K rounds\" where `K = max_dry_rounds - dry_streak`.\n\nFor a `Settled` round this is the streak AS OF that round (snapshotted at draw); for the open/drawing round it is the live global streak.\n\n`#[serde(default)]` so responses/clients predating this field still deserialize.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "opens_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "player_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "pool": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "prize_tiers": {
+          "$ref": "#/definitions/PrizeTiers"
+        },
+        "randomness": {
+          "description": "Randomness state for this round, if any has been requested/delivered.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RandomnessRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rolled_over_from": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "status": {
+          "$ref": "#/definitions/RoundStatus"
+        },
+        "ticket_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "winning_numbers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0.0
+          }
+        },
+        "winning_tickets": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Addr": {
+          "description": "A human readable address.\n\nIn Cosmos, this is typically bech32 encoded. But for multi-chain smart contracts no assumptions should be made other than being UTF-8 encoded and of reasonable length.\n\nThis type represents a validated address. It can be created in the following ways 1. Use `Addr::unchecked(input)` 2. Use `let checked: Addr = deps.api.addr_validate(input)?` 3. Use `let checked: Addr = deps.api.addr_humanize(canonical_addr)?` 4. Deserialize from JSON. This must only be done from JSON that was validated before such as a contract's state. `Addr` must not be used in messages sent by the user because this would result in unvalidated instances.\n\nThis type is immutable. If you really need to mutate it (Really? Are you sure?), create a mutable copy using `let mut mutable = Addr::to_string()` and operate on that `String` instance.",
+          "type": "string"
+        },
+        "HexBinary": {
+          "description": "This is a wrapper around Vec<u8> to add hex de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is similar to `cosmwasm_std::Binary` but uses hex. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+          "type": "string"
+        },
+        "PrizeTiers": {
+          "description": "Prize amount assigned to each matching tier. `tier_N` is the reward for a ticket matching exactly N of the winning numbers. `tier_6` is the jackpot. Computed at draw time from the round pool and the number of winners per tier so the contract only ever promises what it holds.",
+          "type": "object",
+          "required": [
+            "tier_3",
+            "tier_4",
+            "tier_5",
+            "tier_6"
+          ],
+          "properties": {
+            "tier_3": {
+              "description": "Per-winner payout for a 3-match.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            },
+            "tier_4": {
+              "description": "Per-winner payout for a 4-match.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            },
+            "tier_5": {
+              "description": "Per-winner payout for a 5-match.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            },
+            "tier_6": {
+              "description": "Per-winner payout for a 6-match (jackpot).",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "RandomnessRequest": {
+          "description": "The randomness state for a single lottery round.",
+          "type": "object",
+          "required": [
+            "beacon_round",
+            "round_id",
+            "status"
+          ],
+          "properties": {
+            "beacon_round": {
+              "description": "The drand/beacon round the randomness must correspond to. For commit-reveal / mock this mirrors `round_id`.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "commit_height": {
+              "description": "Commit-reveal: block height at which the commitment was posted. The reveal must occur at a strictly later height (a minimum-delay window) so the outcome cannot be precomputed at commit time. `None` until a commit lands.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "commitment": {
+              "description": "Commit-reveal: the committed `sha256(value)` hash. `None` otherwise.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "committer": {
+              "description": "Commit-reveal: the submitter that posted the commitment. Only this exact address may reveal (accountability + binding). `None` until a commit lands.\n\n`#[serde(default)]` so pre-upgrade `RandomnessRequest` entries (which lacked these fields) still deserialize, defaulting to `None`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Addr"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "randomness": {
+              "description": "The 32-byte verified randomness once delivered. `None` while pending.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reveal_deadline": {
+              "description": "Commit-reveal: unix-seconds deadline after which, if the reveal never arrives, the round may be cancelled/recovered. `None` until a commit lands.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "round_id": {
+              "description": "The lottery round this randomness is for.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "signature": {
+              "description": "The beacon signature that was verified (audit trail). `None` otherwise.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "description": "Current status.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RandomnessStatus"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "RandomnessStatus": {
+          "description": "Lifecycle of a round's randomness.",
+          "oneOf": [
+            {
+              "description": "Awaiting randomness (or a commitment).",
+              "type": "string",
+              "enum": [
+                "pending"
+              ]
+            },
+            {
+              "description": "Commit-reveal only: a commitment hash is stored, awaiting reveal.",
+              "type": "string",
+              "enum": [
+                "committed"
+              ]
+            },
+            {
+              "description": "Randomness delivered and verified. The round can be drawn.",
+              "type": "string",
+              "enum": [
+                "fulfilled"
+              ]
+            }
+          ]
+        },
+        "RoundStatus": {
+          "description": "State machine for a single lottery round.\n\nTypical progression: `Open` → `Drawing` → `Drawn` → `Settled`\n\n`Cancelled` is a terminal state reachable from `Open`/`Drawing` (e.g. the randomness beacon never arrived and admins refund tickets).",
+          "oneOf": [
+            {
+              "description": "Accepting ticket purchases.",
+              "type": "string",
+              "enum": [
+                "open"
+              ]
+            },
+            {
+              "description": "Sales closed; awaiting randomness (beacon or reveal) to pick numbers.",
+              "type": "string",
+              "enum": [
+                "drawing"
+              ]
+            },
+            {
+              "description": "Winning numbers determined; prizes computed but not yet all claimed.",
+              "type": "string",
+              "enum": [
+                "drawn"
+              ]
+            },
+            {
+              "description": "All payouts distributed / claim window closed; round is finalized.",
+              "type": "string",
+              "enum": [
+                "settled"
+              ]
+            },
+            {
+              "description": "Round aborted; stakes are refundable.",
+              "type": "string",
+              "enum": [
+                "cancelled"
+              ]
+            }
+          ]
+        },
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "pending_top_up": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "PendingTopUpResponse",
+      "type": "object",
+      "required": [
+        "amount",
+        "denom",
+        "round_id"
+      ],
+      "properties": {
+        "amount": {
+          "description": "Escrowed usaf awaiting that round's open (zero if none).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "denom": {
+          "type": "string"
+        },
+        "round_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "prize": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "PrizeResponse",
+      "type": "object",
+      "required": [
+        "claimable",
+        "claimed",
+        "owner",
+        "round_id",
+        "winning_ticket_ids"
+      ],
+      "properties": {
+        "claimable": {
+          "description": "Sum of prizes on unclaimed winning tickets (still claimable).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "claimed": {
+          "description": "Sum of prizes already paid out.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "owner": {
+          "type": "string"
+        },
+        "round_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "winning_ticket_ids": {
+          "description": "The owner's winning ticket ids in this round.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "referral_summary": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ReferralSummaryResponse",
+      "type": "object",
+      "required": [
+        "addr",
+        "denom",
+        "lifetime_claimed",
+        "lifetime_earned",
+        "pending",
+        "referees"
+      ],
+      "properties": {
+        "addr": {
+          "type": "string"
+        },
+        "denom": {
+          "type": "string"
+        },
+        "lifetime_claimed": {
+          "description": "Lifetime earnings already claimed.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "lifetime_earned": {
+          "description": "Lifetime earnings attributed (claimed + pending).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "pending": {
+          "description": "Accrued, unclaimed usaf.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "referees": {
+          "description": "Number of referees bound to this referrer.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "referrer": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ReferrerResponse",
+      "type": "object",
+      "properties": {
+        "referrer": {
+          "description": "`None` when the referee is unbound.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "round": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RoundResponse",
+      "type": "object",
+      "required": [
+        "closes_at",
+        "id",
+        "opens_at",
+        "player_count",
+        "pool",
+        "prize_tiers",
+        "status",
+        "ticket_count",
+        "winning_tickets"
+      ],
+      "properties": {
+        "closes_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "dry_streak": {
+          "description": "\"Must Be Won\" dry streak: consecutive QUALIFYING rounds (>= 2 distinct players) that settled with no jackpot winner and were not force- distributed. Empty and single-player rounds are neutral and never advance it. Lets the UI show \"must be won in K rounds\" where `K = max_dry_rounds - dry_streak`.\n\nFor a `Settled` round this is the streak AS OF that round (snapshotted at draw); for the open/drawing round it is the live global streak.\n\n`#[serde(default)]` so responses/clients predating this field still deserialize.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "opens_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "player_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "pool": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "prize_tiers": {
+          "$ref": "#/definitions/PrizeTiers"
+        },
+        "randomness": {
+          "description": "Randomness state for this round, if any has been requested/delivered.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RandomnessRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rolled_over_from": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "status": {
+          "$ref": "#/definitions/RoundStatus"
+        },
+        "ticket_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "winning_numbers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0.0
+          }
+        },
+        "winning_tickets": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Addr": {
+          "description": "A human readable address.\n\nIn Cosmos, this is typically bech32 encoded. But for multi-chain smart contracts no assumptions should be made other than being UTF-8 encoded and of reasonable length.\n\nThis type represents a validated address. It can be created in the following ways 1. Use `Addr::unchecked(input)` 2. Use `let checked: Addr = deps.api.addr_validate(input)?` 3. Use `let checked: Addr = deps.api.addr_humanize(canonical_addr)?` 4. Deserialize from JSON. This must only be done from JSON that was validated before such as a contract's state. `Addr` must not be used in messages sent by the user because this would result in unvalidated instances.\n\nThis type is immutable. If you really need to mutate it (Really? Are you sure?), create a mutable copy using `let mut mutable = Addr::to_string()` and operate on that `String` instance.",
+          "type": "string"
+        },
+        "HexBinary": {
+          "description": "This is a wrapper around Vec<u8> to add hex de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is similar to `cosmwasm_std::Binary` but uses hex. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+          "type": "string"
+        },
+        "PrizeTiers": {
+          "description": "Prize amount assigned to each matching tier. `tier_N` is the reward for a ticket matching exactly N of the winning numbers. `tier_6` is the jackpot. Computed at draw time from the round pool and the number of winners per tier so the contract only ever promises what it holds.",
+          "type": "object",
+          "required": [
+            "tier_3",
+            "tier_4",
+            "tier_5",
+            "tier_6"
+          ],
+          "properties": {
+            "tier_3": {
+              "description": "Per-winner payout for a 3-match.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            },
+            "tier_4": {
+              "description": "Per-winner payout for a 4-match.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            },
+            "tier_5": {
+              "description": "Per-winner payout for a 5-match.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            },
+            "tier_6": {
+              "description": "Per-winner payout for a 6-match (jackpot).",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "RandomnessRequest": {
+          "description": "The randomness state for a single lottery round.",
+          "type": "object",
+          "required": [
+            "beacon_round",
+            "round_id",
+            "status"
+          ],
+          "properties": {
+            "beacon_round": {
+              "description": "The drand/beacon round the randomness must correspond to. For commit-reveal / mock this mirrors `round_id`.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "commit_height": {
+              "description": "Commit-reveal: block height at which the commitment was posted. The reveal must occur at a strictly later height (a minimum-delay window) so the outcome cannot be precomputed at commit time. `None` until a commit lands.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "commitment": {
+              "description": "Commit-reveal: the committed `sha256(value)` hash. `None` otherwise.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "committer": {
+              "description": "Commit-reveal: the submitter that posted the commitment. Only this exact address may reveal (accountability + binding). `None` until a commit lands.\n\n`#[serde(default)]` so pre-upgrade `RandomnessRequest` entries (which lacked these fields) still deserialize, defaulting to `None`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Addr"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "randomness": {
+              "description": "The 32-byte verified randomness once delivered. `None` while pending.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reveal_deadline": {
+              "description": "Commit-reveal: unix-seconds deadline after which, if the reveal never arrives, the round may be cancelled/recovered. `None` until a commit lands.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "round_id": {
+              "description": "The lottery round this randomness is for.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "signature": {
+              "description": "The beacon signature that was verified (audit trail). `None` otherwise.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "description": "Current status.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RandomnessStatus"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "RandomnessStatus": {
+          "description": "Lifecycle of a round's randomness.",
+          "oneOf": [
+            {
+              "description": "Awaiting randomness (or a commitment).",
+              "type": "string",
+              "enum": [
+                "pending"
+              ]
+            },
+            {
+              "description": "Commit-reveal only: a commitment hash is stored, awaiting reveal.",
+              "type": "string",
+              "enum": [
+                "committed"
+              ]
+            },
+            {
+              "description": "Randomness delivered and verified. The round can be drawn.",
+              "type": "string",
+              "enum": [
+                "fulfilled"
+              ]
+            }
+          ]
+        },
+        "RoundStatus": {
+          "description": "State machine for a single lottery round.\n\nTypical progression: `Open` → `Drawing` → `Drawn` → `Settled`\n\n`Cancelled` is a terminal state reachable from `Open`/`Drawing` (e.g. the randomness beacon never arrived and admins refund tickets).",
+          "oneOf": [
+            {
+              "description": "Accepting ticket purchases.",
+              "type": "string",
+              "enum": [
+                "open"
+              ]
+            },
+            {
+              "description": "Sales closed; awaiting randomness (beacon or reveal) to pick numbers.",
+              "type": "string",
+              "enum": [
+                "drawing"
+              ]
+            },
+            {
+              "description": "Winning numbers determined; prizes computed but not yet all claimed.",
+              "type": "string",
+              "enum": [
+                "drawn"
+              ]
+            },
+            {
+              "description": "All payouts distributed / claim window closed; round is finalized.",
+              "type": "string",
+              "enum": [
+                "settled"
+              ]
+            },
+            {
+              "description": "Round aborted; stakes are refundable.",
+              "type": "string",
+              "enum": [
+                "cancelled"
+              ]
+            }
+          ]
+        },
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "tickets": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "TicketsResponse",
+      "type": "object",
+      "required": [
+        "tickets"
+      ],
+      "properties": {
+        "tickets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TicketInfo"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Addr": {
+          "description": "A human readable address.\n\nIn Cosmos, this is typically bech32 encoded. But for multi-chain smart contracts no assumptions should be made other than being UTF-8 encoded and of reasonable length.\n\nThis type represents a validated address. It can be created in the following ways 1. Use `Addr::unchecked(input)` 2. Use `let checked: Addr = deps.api.addr_validate(input)?` 3. Use `let checked: Addr = deps.api.addr_humanize(canonical_addr)?` 4. Deserialize from JSON. This must only be done from JSON that was validated before such as a contract's state. `Addr` must not be used in messages sent by the user because this would result in unvalidated instances.\n\nThis type is immutable. If you really need to mutate it (Really? Are you sure?), create a mutable copy using `let mut mutable = Addr::to_string()` and operate on that `String` instance.",
+          "type": "string"
+        },
+        "Ticket": {
+          "description": "A purchased ticket.",
+          "type": "object",
+          "required": [
+            "claimed",
+            "matches",
+            "numbers",
+            "owner",
+            "prize"
+          ],
+          "properties": {
+            "claimed": {
+              "description": "Whether the prize has been claimed. Guards double-spend.",
+              "type": "boolean"
+            },
+            "free": {
+              "description": "Whether this ticket was granted free (operator-sponsored bonus ticket via `GrantBonusTicket`) rather than paid for by the owner. A free ticket is still fully funded (the operator sponsors its pool contribution) so it wins/claims exactly like a paid ticket; this flag is informational only.\n\n`#[serde(default)]` so a Ticket persisted before this upgrade (which lacked the field) still deserializes, defaulting to `false` (paid).",
+              "default": false,
+              "type": "boolean"
+            },
+            "matches": {
+              "description": "How many of `numbers` matched the winning numbers. `0` until drawn.",
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            },
+            "numbers": {
+              "description": "The `numbers_per_ticket` distinct picks (sorted ascending).",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              }
+            },
+            "owner": {
+              "description": "Buyer / prize recipient.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Addr"
+                }
+              ]
+            },
+            "prize": {
+              "description": "Prize owed to this ticket (usaf). `0` until drawn / non-winning.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "TicketInfo": {
+          "description": "A ticket paired with its stable id (round-local sequence).",
+          "type": "object",
+          "required": [
+            "ticket",
+            "ticket_id"
+          ],
+          "properties": {
+            "ticket": {
+              "$ref": "#/definitions/Ticket"
+            },
+            "ticket_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "treasury_balance": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "TreasuryBalanceResponse",
+      "type": "object",
+      "required": [
+        "balance",
+        "denom"
+      ],
+      "properties": {
+        "balance": {
+          "description": "In-contract treasury balance in usaf (withdrawable by the admin).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "denom": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

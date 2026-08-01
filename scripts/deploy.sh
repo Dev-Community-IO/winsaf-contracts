@@ -42,7 +42,8 @@ command -v jq >/dev/null || die "jq not found"
 CHAIN_ID="$(jq -r '.chainId' "$CHAIN_JSON")"
 RPC="${CHAIN_RPC_URL:-$(jq -r '.endpoints.rpc' "$CHAIN_JSON")}"
 DENOM="usaf"
-GAS_PRICES="0.025${DENOM}"
+# Prefer chain JSON gas.price (mainnet ~0.05usaf); allow CHAIN_GAS_PRICE override.
+GAS_PRICES="${CHAIN_GAS_PRICE:-$(jq -r '.gas.price // "0.025usaf"' "$CHAIN_JSON")}"
 KOPTS="--keyring-backend $KEYRING_BACKEND"
 TXFLAGS="--chain-id $CHAIN_ID --node $RPC --gas auto --gas-adjustment 1.5 --gas-prices $GAS_PRICES --broadcast-mode sync -y --output json"
 

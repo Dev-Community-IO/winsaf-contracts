@@ -61,8 +61,26 @@ pub enum ContractError {
         expected: String,
     },
 
+    /// `TopUpPool` rejected because the round exists but is no longer Open.
+    #[error("round {round_id} cannot accept a pool top-up (status: {status})")]
+    RoundNotOpenForTopUp { round_id: u64, status: String },
+
+    /// `CancelPendingTopUp` / invalid future id when nothing is escrowed.
+    #[error("no pending top-up for round {round_id}")]
+    NoPendingTopUp { round_id: u64 },
+
     #[error("count must be between 1 and {max} (got {count})")]
     InvalidTicketCount { count: u32, max: u32 },
+
+    /// Round would exceed the hard per-round ticket cap (draw/cancel gas bound).
+    #[error(
+        "round ticket cap exceeded: current {current}, requested {requested}, max {max}"
+    )]
+    RoundTicketCap {
+        current: u64,
+        requested: u32,
+        max: u64,
+    },
 
     #[error("ticket must have exactly {expected} distinct numbers in 1..={number_max} (got {reason})")]
     InvalidNumbers {

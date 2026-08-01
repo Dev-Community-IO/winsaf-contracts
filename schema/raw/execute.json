@@ -1,0 +1,748 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExecuteMsg",
+  "oneOf": [
+    {
+      "description": "Buy `count` tickets for the current open round. Must send exactly `count * ticket_price` in `denom`. `numbers` (when provided) sets the picks for the FIRST ticket; remaining tickets (and all tickets when omitted) are quick-picked. `referral_code` binds/uses a referral code.",
+      "type": "object",
+      "required": [
+        "buy_tickets"
+      ],
+      "properties": {
+        "buy_tickets": {
+          "type": "object",
+          "required": [
+            "count"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "numbers": {
+              "description": "Explicit picks for the first ticket; `None` = quick-pick all.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              }
+            },
+            "referral_code": {
+              "description": "Optional referral code identifying the buyer's referrer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Authorized-submitter-or-admin only: mint `count` operator-sponsored bonus tickets OWNED BY `owner`, flagged free, into the current open round. Backs an off-chain \"redeem XP for a free ticket\" feature. The caller MUST attach exactly `count * ticket_price` in `denom` (the operator sponsors the pool contribution so the user pays nothing); the full amount is added to the round pool so the granted tickets are honestly funded and can win / be claimed by `owner` like any paid ticket. `numbers` (when provided) sets the picks for the FIRST ticket; remaining tickets (and all when omitted) are quick-picked — exactly like `BuyTickets`.",
+      "type": "object",
+      "required": [
+        "grant_bonus_ticket"
+      ],
+      "properties": {
+        "grant_bonus_ticket": {
+          "type": "object",
+          "required": [
+            "count",
+            "owner"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "numbers": {
+              "description": "Explicit picks for the first ticket; `None` = quick-pick all.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              }
+            },
+            "owner": {
+              "description": "Beneficiary who OWNS the minted bonus tickets.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Admin-only: mint `count` bonus tickets OWNED BY `owner`, flagged free, into the current open round, funded from the in-contract TREASURY balance (NOT from attached funds). Backs the \"redeem XP for a free ticket\" feature without any external SAF float: the caller sends NO funds, `count * ticket_price` is debited from the treasury and added to the round pool so the granted tickets are honestly funded and can win / be claimed by `owner` like any paid ticket. Fails with `InsufficientTreasury` if the treasury cannot cover the grant. Rejected while the contract is paused. `numbers` (when provided) sets the picks for the FIRST ticket; the rest are quick-picked — exactly like `GrantBonusTicket`.",
+      "type": "object",
+      "required": [
+        "grant_bonus_ticket_from_treasury"
+      ],
+      "properties": {
+        "grant_bonus_ticket_from_treasury": {
+          "type": "object",
+          "required": [
+            "count",
+            "owner"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "numbers": {
+              "description": "Explicit picks for the first ticket; `None` = quick-pick all.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              }
+            },
+            "owner": {
+              "description": "Beneficiary who OWNS the minted bonus tickets.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Permissionless: close the current round once `closes_at` has passed. Transitions `Open → Drawing`.",
+      "type": "object",
+      "required": [
+        "close_round"
+      ],
+      "properties": {
+        "close_round": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Authorized-submitter-only: deliver randomness for a closed round and (once verified per mode) mark it fulfilled so it can be drawn.",
+      "type": "object",
+      "required": [
+        "submit_randomness"
+      ],
+      "properties": {
+        "submit_randomness": {
+          "type": "object",
+          "required": [
+            "randomness",
+            "round_id"
+          ],
+          "properties": {
+            "randomness": {
+              "description": "32-byte beacon output (hex).",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                }
+              ]
+            },
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "signature": {
+              "description": "drand/nois BLS signature (verified in drand mode; ignored in mock).",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Commit-reveal mode only — step 1. An authorized submitter commits to `sha256(value)` for a closed round without revealing `value`.",
+      "type": "object",
+      "required": [
+        "commit_randomness"
+      ],
+      "properties": {
+        "commit_randomness": {
+          "type": "object",
+          "required": [
+            "commitment",
+            "round_id"
+          ],
+          "properties": {
+            "commitment": {
+              "$ref": "#/definitions/HexBinary"
+            },
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Commit-reveal mode only — step 2. Reveal the pre-image `value`; the contract checks `sha256(value) == commitment` then fulfils the round.",
+      "type": "object",
+      "required": [
+        "reveal_randomness"
+      ],
+      "properties": {
+        "reveal_randomness": {
+          "type": "object",
+          "required": [
+            "round_id",
+            "value"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "value": {
+              "$ref": "#/definitions/HexBinary"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Compute matches per ticket, fix per-tier prizes from the pool, mark winners and finalize. Consumes the round's fulfilled randomness. If no jackpot winner and rollover is enabled the leftover pool moves to the next round. Transitions `Drawing → Settled` and opens the next round.",
+      "type": "object",
+      "required": [
+        "draw"
+      ],
+      "properties": {
+        "draw": {
+          "type": "object",
+          "required": [
+            "round_id"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Recover a stuck `Drawing` round whose randomness never fulfilled. Admin may call at any time; anyone may call once `closes_at + CANCEL_GRACE_SECONDS` has passed (or, in commit-reveal, once the commitment's `reveal_deadline` has passed). Marks the round `Cancelled`, converts the retained pool into pro-rata pull-refunds for ticket buyers (claimed via `ClaimReward`), and opens the next round so the lifecycle is never permanently blocked.",
+      "type": "object",
+      "required": [
+        "cancel_round"
+      ],
+      "properties": {
+        "cancel_round": {
+          "type": "object",
+          "required": [
+            "round_id"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Pull-based prize payout (or, for a `Cancelled` round, the buyer's pro-rata refund). Only the ticket owner may claim, only if the assigned amount is non-zero and not yet claimed.",
+      "type": "object",
+      "required": [
+        "claim_reward"
+      ],
+      "properties": {
+        "claim_reward": {
+          "type": "object",
+          "required": [
+            "round_id",
+            "ticket_id"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "ticket_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Bind the caller (referee) to a referrer, once and immutably. Provide a `referrer` address and/or a `code` that resolves to one. Self-referral is rejected.",
+      "type": "object",
+      "required": [
+        "bind_referrer"
+      ],
+      "properties": {
+        "bind_referrer": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "referrer": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Register a unique, case-insensitive referral `code` for the caller.",
+      "type": "object",
+      "required": [
+        "register_code"
+      ],
+      "properties": {
+        "register_code": {
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Referrer pulls their accrued, unclaimed earnings (subject to `min_claim_usaf`). Sends the full pending balance.",
+      "type": "object",
+      "required": [
+        "claim_referral"
+      ],
+      "properties": {
+        "claim_referral": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Admin-only: move `amount` usaf from the tracked treasury balance to `to`.",
+      "type": "object",
+      "required": [
+        "withdraw_treasury"
+      ],
+      "properties": {
+        "withdraw_treasury": {
+          "type": "object",
+          "required": [
+            "amount",
+            "to"
+          ],
+          "properties": {
+            "amount": {
+              "$ref": "#/definitions/Uint128"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Admin-only: seed a round's prize pool without minting tickets. Caller attaches a non-zero amount of `denom`. If `round_id` is the current Open round, funds are added to `round.pool` immediately. If `round_id` is a future round (not yet opened), funds are escrowed and folded into that round's pool when it opens. Rejected for Drawing/Settled/Cancelled or past round ids. Tier BPS at draw are unchanged; absolute prizes scale.",
+      "type": "object",
+      "required": [
+        "top_up_pool"
+      ],
+      "properties": {
+        "top_up_pool": {
+          "type": "object",
+          "required": [
+            "round_id"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Admin-only: refund escrowed `TopUpPool` funds for a future (not yet opened) round back to the admin. No-op amount fails if nothing pending.",
+      "type": "object",
+      "required": [
+        "cancel_pending_top_up"
+      ],
+      "properties": {
+        "cancel_pending_top_up": {
+          "type": "object",
+          "required": [
+            "round_id"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Admin-only: update mutable config fields (any `None` field is unchanged).",
+      "type": "object",
+      "required": [
+        "set_config"
+      ],
+      "properties": {
+        "set_config": {
+          "type": "object",
+          "properties": {
+            "add_submitters": {
+              "description": "Submitters to ADD to the authorized set.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "admin": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "drand_chain_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "drand_genesis_time": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "drand_period": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "drand_pubkey": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HexBinary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "draw_interval": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "max_dry_rounds": {
+              "description": "\"Must Be Won\" cap: max consecutive dry rounds before a forced jackpot rolldown. `0` disables the feature.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "min_claim_usaf": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Uint128"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "open_code_registration": {
+              "description": "Toggle permissionless referral-code registration.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "randomness_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RandomnessMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "remove_submitters": {
+              "description": "Submitters to REMOVE from the authorized set.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "reveal_timeout": {
+              "description": "Commit-reveal reveal timeout (seconds).",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "rollover_on_no_winner": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "split": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/FundSplitBps"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ticket_price": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Coin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "verify_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/VerifyMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Admin-only kill switch (blocks buys).",
+      "type": "object",
+      "required": [
+        "pause"
+      ],
+      "properties": {
+        "pause": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Admin-only resume.",
+      "type": "object",
+      "required": [
+        "unpause"
+      ],
+      "properties": {
+        "unpause": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "Coin": {
+      "type": "object",
+      "required": [
+        "amount",
+        "denom"
+      ],
+      "properties": {
+        "amount": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "denom": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FundSplitBps": {
+      "description": "Revenue split in basis points. Invariant: `prize + referral + treasury == 10000`.",
+      "type": "object",
+      "required": [
+        "prize_bps",
+        "referral_bps",
+        "treasury_bps"
+      ],
+      "properties": {
+        "prize_bps": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "referral_bps": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "treasury_bps": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "HexBinary": {
+      "description": "This is a wrapper around Vec<u8> to add hex de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is similar to `cosmwasm_std::Binary` but uses hex. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+      "type": "string"
+    },
+    "RandomnessMode": {
+      "description": "Which randomness mechanism this contract operates.",
+      "oneOf": [
+        {
+          "description": "External drand beacon delivered by an authorized relayer.",
+          "type": "string",
+          "enum": [
+            "drand"
+          ]
+        },
+        {
+          "description": "On-chain commit-reveal fallback.",
+          "type": "string",
+          "enum": [
+            "commit_reveal"
+          ]
+        },
+        {
+          "description": "Localnet mock: any authorized submitter can push randomness with no crypto verification. NEVER for mainnet.",
+          "type": "string",
+          "enum": [
+            "mock"
+          ]
+        }
+      ]
+    },
+    "Uint128": {
+      "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+      "type": "string"
+    },
+    "VerifyMode": {
+      "description": "How delivered drand randomness is verified before it is accepted.",
+      "oneOf": [
+        {
+          "description": "Full drand BLS verification against `drand_pubkey` + `drand_chain_hash`. The ONLY mode that should be used on mainnet with `RandomnessMode::Drand`.",
+          "type": "string",
+          "enum": [
+            "bls"
+          ]
+        },
+        {
+          "description": "Development verifier: structural checks only (length, randomness == sha256(sig)) — NO BLS pairing check. Gated behind config so it can never be silently active in production.",
+          "type": "string",
+          "enum": [
+            "dev"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MigrateMsg",
+  "description": "Migration parameters. All fields are optional; a bare `{}` performs a plain version bump (the legacy behaviour). The fields let an admin rewrite config values that `SetConfig` cannot change — chiefly the number domain — during a code migration, so a live contract can adopt real parameters WITHOUT a fresh instantiate (preserving its address, pool and outstanding claims).",
+  "type": "object",
+  "properties": {
+    "draw_interval": {
+      "description": "Overwrite `Config.draw_interval` (seconds). Only affects rounds opened AFTER the migration — an already-open round keeps its fixed `closes_at`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "max_dry_rounds": {
+      "description": "Overwrite `Config.max_dry_rounds` (0 disables the forced-rolldown cap).",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "number_max": {
+      "description": "Overwrite `Config.number_max` (number-domain upper bound). Re-validates the domain against the effective `numbers_per_ticket`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "minimum": 0.0
+    },
+    "numbers_per_ticket": {
+      "description": "Overwrite `Config.numbers_per_ticket`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "minimum": 0.0
+    },
+    "reset_dry_streak": {
+      "description": "Reset the global \"Must Be Won\" dry streak to 0 (clears an inflated streak accumulated before the empty/single-player-neutral fix).",
+      "default": false,
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

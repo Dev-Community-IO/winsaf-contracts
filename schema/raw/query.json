@@ -1,0 +1,212 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "QueryMsg",
+  "oneOf": [
+    {
+      "description": "Current protocol config.",
+      "type": "object",
+      "required": [
+        "config"
+      ],
+      "properties": {
+        "config": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "The round currently accepting tickets.",
+      "type": "object",
+      "required": [
+        "current_round"
+      ],
+      "properties": {
+        "current_round": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "A specific round by id.",
+      "type": "object",
+      "required": [
+        "round"
+      ],
+      "properties": {
+        "round": {
+          "type": "object",
+          "required": [
+            "round_id"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Paginated tickets for a round, optionally filtered by owner.",
+      "type": "object",
+      "required": [
+        "tickets"
+      ],
+      "properties": {
+        "tickets": {
+          "type": "object",
+          "required": [
+            "round_id"
+          ],
+          "properties": {
+            "limit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "owner": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "start_after": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Total prize owed to `owner` across their tickets in a round, split into claimable (unclaimed) and already-claimed totals.",
+      "type": "object",
+      "required": [
+        "prize"
+      ],
+      "properties": {
+        "prize": {
+          "type": "object",
+          "required": [
+            "owner",
+            "round_id"
+          ],
+          "properties": {
+            "owner": {
+              "type": "string"
+            },
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "The referrer a referee is bound to (if any).",
+      "type": "object",
+      "required": [
+        "referrer"
+      ],
+      "properties": {
+        "referrer": {
+          "type": "object",
+          "required": [
+            "referee"
+          ],
+          "properties": {
+            "referee": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Full referrer summary: pending + lifetime aggregates.",
+      "type": "object",
+      "required": [
+        "referral_summary"
+      ],
+      "properties": {
+        "referral_summary": {
+          "type": "object",
+          "required": [
+            "addr"
+          ],
+          "properties": {
+            "addr": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "The in-contract treasury balance (usaf).",
+      "type": "object",
+      "required": [
+        "treasury_balance"
+      ],
+      "properties": {
+        "treasury_balance": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Escrowed promotional seed for a round that has not opened yet.",
+      "type": "object",
+      "required": [
+        "pending_top_up"
+      ],
+      "properties": {
+        "pending_top_up": {
+          "type": "object",
+          "required": [
+            "round_id"
+          ],
+          "properties": {
+            "round_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

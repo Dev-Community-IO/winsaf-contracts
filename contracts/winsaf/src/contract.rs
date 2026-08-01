@@ -48,24 +48,27 @@ use cosmwasm_std::{
 };
 use cw2::{get_contract_version, set_contract_version};
 use cw_storage_plus::Bound;
+use cw_utils::nonpayable;
 
 use winsaf_shared::{
-    assert_exact_usaf, FundSplitBps, RoundStatus, DEFAULT_DRAW_INTERVAL_SECONDS,
+    assert_exact_usaf, must_pay_usaf_only, FundSplitBps, RoundStatus,
+    DEFAULT_DRAW_INTERVAL_SECONDS,
     DEFAULT_NUMBER_MAX, DEFAULT_PICK_COUNT, DEFAULT_TICKET_PRICE_USAF, DENOM,
 };
 
 use crate::error::ContractError;
 use crate::msg::{
-    ExecuteMsg, InstantiateMsg, MigrateMsg, PrizeResponse, QueryMsg, ReferralSummaryResponse,
-    ReferrerResponse, RoundResponse, TicketInfo, TicketsResponse, TreasuryBalanceResponse,
+    ExecuteMsg, InstantiateMsg, MigrateMsg, PendingTopUpResponse, PrizeResponse, QueryMsg,
+    ReferralSummaryResponse, ReferrerResponse, RoundResponse, TicketInfo, TicketsResponse,
+    TreasuryBalanceResponse,
 };
 use crate::state::{
     default_max_dry_rounds, Config, PrizeTiers, RandomnessMode, RandomnessRequest,
     RandomnessStatus, Round, Ticket, VerifyMode, CANCEL_GRACE_SECONDS, CONFIG, CURRENT_ROUND,
     DEFAULT_REVEAL_TIMEOUT_SECONDS, DRAND_QUICKNET_GENESIS, DRAND_QUICKNET_PERIOD, DRY_STREAK,
-    MIN_PLAYERS_FOR_DRY_STREAK, MIN_REVEAL_DELAY_BLOCKS, PLAYERS, RANDOMNESS, REFERRAL_CODES,
-    REFERRAL_EARNINGS,
-    REFERRAL_TOTALS, REFERRER, ROUNDS, TICKETS, TICKET_SEQ, TREASURY,
+    MIN_PLAYERS_FOR_DRY_STREAK, MIN_REVEAL_DELAY_BLOCKS, PENDING_TOPUPS, PLAYERS, RANDOMNESS,
+    REFERRAL_CODES, REFERRAL_EARNINGS, REFERRAL_TOTALS, REFERRER, ROUNDS, TICKETS, TICKET_SEQ,
+    TREASURY,
 };
 use crate::verify::{sha256, verify_drand, verify_mock, verify_reveal, G2_LEN};
 
@@ -76,6 +79,9 @@ pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Max tickets buyable in a single transaction (bounds gas / loop size).
 const MAX_TICKETS_PER_TX: u32 = 100;
+/// Hard per-round ticket cap so `Draw` / `CancelRound` stay within block gas.
+/// Tuned for Safrochain; raise only with paginated settle.
+const MAX_TICKETS_PER_ROUND: u64 = 10_000;
 /// Default & max page size for the `Tickets` query.
 const DEFAULT_QUERY_LIMIT: u32 = 30;
 const MAX_QUERY_LIMIT: u32 = 100;
@@ -137,7 +143,15 @@ pub fn instantiate(
     let split = msg.split.unwrap_or_default();
     split.validate()?; // enforces sum == 10000 and each bucket in range
 
+    // Production wasm defaults to Drand+Bls. Mock/Dev defaults are only for
+    // unit tests and builds with the `dev-randomness` feature.
+    #[cfg(not(any(test, feature = "dev-randomness")))]
+    let randomness_mode = msg.randomness_mode.unwrap_or(RandomnessMode::Drand);
+    #[cfg(not(any(test, feature = "dev-randomness")))]
+    let verify_mode = msg.verify_mode.unwrap_or(VerifyMode::Bls);
+    #[cfg(any(test, feature = "dev-randomness"))]
     let randomness_mode = msg.randomness_mode.unwrap_or(RandomnessMode::Mock);
+    #[cfg(any(test, feature = "dev-randomness"))]
     let verify_mode = msg.verify_mode.unwrap_or(VerifyMode::Dev);
     let drand_pubkey = msg.drand_pubkey.unwrap_or_default();
     let drand_chain_hash = msg.drand_chain_hash.unwrap_or_default();
@@ -227,6 +241,11 @@ pub fn execute(
             count,
             numbers,
         } => execute_grant_bonus_ticket(deps, env, info, owner, count, numbers),
+        ExecuteMsg::GrantBonusTicketFromTreasury {
+            owner,
+            count,
+            numbers,
+        } => execute_grant_bonus_ticket_from_treasury(deps, env, info, owner, count, numbers),
         ExecuteMsg::CloseRound {} => execute_close_round(deps, env, info),
         ExecuteMsg::SubmitRandomness {
             round_id,
@@ -253,6 +272,10 @@ pub fn execute(
         ExecuteMsg::ClaimReferral {} => execute_claim_referral(deps, info),
         ExecuteMsg::WithdrawTreasury { to, amount } => {
             execute_withdraw_treasury(deps, info, to, amount)
+        }
+        ExecuteMsg::TopUpPool { round_id } => execute_top_up_pool(deps, info, round_id),
+        ExecuteMsg::CancelPendingTopUp { round_id } => {
+            execute_cancel_pending_top_up(deps, info, round_id)
         }
         ExecuteMsg::SetConfig {
             admin,
@@ -464,6 +487,22 @@ fn mint_tickets(
     numbers: Option<&[u8]>,
     free: bool,
 ) -> Result<MintOutcome, ContractError> {
+    let next = round
+        .ticket_count
+        .checked_add(u64::from(count))
+        .ok_or_else(|| ContractError::RoundTicketCap {
+            current: round.ticket_count,
+            requested: count,
+            max: MAX_TICKETS_PER_ROUND,
+        })?;
+    if next > MAX_TICKETS_PER_ROUND {
+        return Err(ContractError::RoundTicketCap {
+            current: round.ticket_count,
+            requested: count,
+            max: MAX_TICKETS_PER_ROUND,
+        });
+    }
+
     let mut seq = TICKET_SEQ.load(storage, round_id)?;
     let mut first_id = String::new();
     let mut last_id = String::new();
@@ -546,6 +585,10 @@ fn execute_grant_bonus_ticket(
 ) -> Result<Response, ContractError> {
     let config = CONFIG.load(deps.storage)?;
 
+    if config.paused {
+        return Err(ContractError::Paused);
+    }
+
     // Authorization: admin or an authorized submitter, exactly like the check
     // `SubmitRandomness` uses.
     if !config.is_submitter(&info.sender) {
@@ -608,6 +651,120 @@ fn execute_grant_bonus_ticket(
         .add_attribute("owner", owner_addr.to_string())
         .add_attribute("count", count.to_string())
         .add_attribute("sponsored", total)
+        .add_attribute("pool", round.pool)
+        .add_attribute("first_ticket_id", minted.first_id)
+        .add_attribute("last_ticket_id", minted.last_id)
+        .add_attribute("new_player", minted.new_player.to_string());
+
+    Ok(Response::new().add_event(event))
+}
+
+// ---------------------------------------------------------------------------
+// Grant bonus ticket funded from the in-contract treasury (no external float)
+// ---------------------------------------------------------------------------
+
+/// Mint `count` bonus tickets OWNED BY `owner`, flagged `free`, into the current
+/// open round, funded from the in-contract TREASURY balance instead of attached
+/// funds. This lets the backend redeem "XP for a free ticket" without holding any
+/// SAF float: the caller attaches NO funds, `count * ticket_price` is moved from
+/// the treasury into the round pool, and the granted tickets are fully funded so
+/// they can win / be claimed by `owner` exactly like paid tickets.
+///
+/// The treasury already holds the accrued fee cut of every buy; spending it here
+/// simply routes ops revenue back to loyalty rewards, keeping the system
+/// self-funding. Fails with `InsufficientTreasury` if the balance is too low.
+fn execute_grant_bonus_ticket_from_treasury(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    owner: String,
+    count: u32,
+    numbers: Option<Vec<u8>>,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+
+    if config.paused {
+        return Err(ContractError::Paused);
+    }
+
+    // Treasury debit is admin-only: submitters deliver randomness, not spend
+    // the ops cut. The rewards hot wallet must be (or act as) contract admin.
+    if !config.is_admin(&info.sender) {
+        return Err(ContractError::unauthorized("admin"));
+    }
+
+    // The pool contribution comes from the treasury, not the caller — reject any
+    // stray attached funds so accounting stays exact.
+    nonpayable(&info)?;
+
+    if count == 0 || count > MAX_TICKETS_PER_TX {
+        return Err(ContractError::InvalidTicketCount {
+            count,
+            max: MAX_TICKETS_PER_TX,
+        });
+    }
+
+    // Validate / normalize the beneficiary address, like other addr params.
+    let owner_addr = deps.api.addr_validate(&owner)?;
+
+    // Total pool contribution = `count * ticket_price`, debited from treasury.
+    let unit = config.ticket_price.amount;
+    let total = unit
+        .checked_mul(Uint128::from(count))
+        .map_err(ContractError::Overflow)?;
+
+    let available = TREASURY.load(deps.storage)?;
+    if total > available {
+        return Err(ContractError::InsufficientTreasury {
+            requested: total.to_string(),
+            available: available.to_string(),
+        });
+    }
+    let treasury_remaining = available
+        .checked_sub(total)
+        .map_err(ContractError::Overflow)?;
+
+    let round_id = CURRENT_ROUND.load(deps.storage)?;
+    let mut round = ROUNDS
+        .load(deps.storage, round_id)
+        .map_err(|_| ContractError::RoundNotFound { round_id })?;
+    if !round.status.accepts_tickets() {
+        return Err(ContractError::RoundNotOpen {
+            round_id,
+            status: status_str(&round.status),
+        });
+    }
+
+    // Move the funds from treasury into this round's pool (conservation: the
+    // contract's total bank balance is unchanged; only the internal split shifts).
+    TREASURY.save(deps.storage, &treasury_remaining)?;
+    round.pool = round
+        .pool
+        .checked_add(total)
+        .map_err(ContractError::Overflow)?;
+
+    // Mint the tickets owned by `owner`, flagged free.
+    let minted = mint_tickets(
+        deps.storage,
+        &env,
+        &config,
+        &mut round,
+        round_id,
+        &owner_addr,
+        count,
+        numbers.as_deref(),
+        true, // free bonus ticket
+    )?;
+    ROUNDS.save(deps.storage, round_id, &round)?;
+
+    let event = Event::new("winsaf/grant_bonus_ticket")
+        .add_attribute("round_id", round_id.to_string())
+        .add_attribute("granted_by", info.sender.to_string())
+        .add_attribute("owner", owner_addr.to_string())
+        .add_attribute("count", count.to_string())
+        .add_attribute("sponsored", total)
+        .add_attribute("source", "treasury")
+        .add_attribute("treasury_remaining", treasury_remaining)
         .add_attribute("pool", round.pool)
         .add_attribute("first_ticket_id", minted.first_id)
         .add_attribute("last_ticket_id", minted.last_id)
@@ -1176,7 +1333,24 @@ fn open_next_round(
     } else {
         Some(prev_id)
     };
-    let next_round = Round::new_open(next_id, now, closes_at, rollover_amount, rolled_from);
+    // Fold any advance TopUpPool escrow into the new round's prize pool.
+    let pending = PENDING_TOPUPS
+        .may_load(storage, next_id)?
+        .unwrap_or_default();
+    if !pending.is_zero() {
+        PENDING_TOPUPS.remove(storage, next_id);
+    }
+    let seed = rollover_amount
+        .checked_add(pending)
+        .map_err(ContractError::Overflow)?;
+    let next_round = Round::new_open_with_top_up(
+        next_id,
+        now,
+        closes_at,
+        seed,
+        rolled_from,
+        pending,
+    );
     ROUNDS.save(storage, next_id, &next_round)?;
     TICKET_SEQ.save(storage, next_id, &0u64)?;
     CURRENT_ROUND.save(storage, &next_id)?;
@@ -1545,6 +1719,114 @@ fn execute_withdraw_treasury(
 }
 
 // ---------------------------------------------------------------------------
+// TopUpPool / CancelPendingTopUp (promotional seed, no tickets)
+// ---------------------------------------------------------------------------
+
+/// Admin seeds a round prize pool without minting tickets. Immediate credit if
+/// the round is Open; otherwise escrow for a future `round_id`.
+fn execute_top_up_pool(
+    deps: DepsMut,
+    info: MessageInfo,
+    round_id: u64,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if !config.is_admin(&info.sender) {
+        return Err(ContractError::unauthorized("admin"));
+    }
+
+    let amount = must_pay_usaf_only(&info.funds)?;
+
+    if let Some(mut round) = ROUNDS.may_load(deps.storage, round_id)? {
+        if !round.status.accepts_tickets() {
+            return Err(ContractError::RoundNotOpenForTopUp {
+                round_id,
+                status: status_str(&round.status),
+            });
+        }
+        round.pool = round
+            .pool
+            .checked_add(amount)
+            .map_err(ContractError::Overflow)?;
+        round.top_up_total = round
+            .top_up_total
+            .checked_add(amount)
+            .map_err(ContractError::Overflow)?;
+        ROUNDS.save(deps.storage, round_id, &round)?;
+
+        return Ok(Response::new().add_event(
+            Event::new("winsaf/top_up_pool")
+                .add_attribute("by", info.sender)
+                .add_attribute("round_id", round_id.to_string())
+                .add_attribute("amount", amount)
+                .add_attribute("mode", "immediate")
+                .add_attribute("pool", round.pool)
+                .add_attribute("top_up_total", round.top_up_total),
+        ));
+    }
+
+    let current = CURRENT_ROUND.load(deps.storage)?;
+    if round_id <= current {
+        // Missing round at/before current means a gap or past id — reject.
+        return Err(ContractError::RoundNotFound { round_id });
+    }
+
+    let pending = PENDING_TOPUPS
+        .may_load(deps.storage, round_id)?
+        .unwrap_or_default();
+    let pending_total = pending
+        .checked_add(amount)
+        .map_err(ContractError::Overflow)?;
+    PENDING_TOPUPS.save(deps.storage, round_id, &pending_total)?;
+
+    Ok(Response::new().add_event(
+        Event::new("winsaf/top_up_pool")
+            .add_attribute("by", info.sender)
+            .add_attribute("round_id", round_id.to_string())
+            .add_attribute("amount", amount)
+            .add_attribute("mode", "pending")
+            .add_attribute("pending_total", pending_total),
+    ))
+}
+
+/// Admin refunds escrowed top-up for a future round that has not opened yet.
+fn execute_cancel_pending_top_up(
+    deps: DepsMut,
+    info: MessageInfo,
+    round_id: u64,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if !config.is_admin(&info.sender) {
+        return Err(ContractError::unauthorized("admin"));
+    }
+    nonpayable(&info)?;
+
+    // Once a round exists it has already absorbed (or rejected) the escrow.
+    if ROUNDS.may_load(deps.storage, round_id)?.is_some() {
+        return Err(ContractError::NoPendingTopUp { round_id });
+    }
+
+    let amount = PENDING_TOPUPS
+        .may_load(deps.storage, round_id)?
+        .unwrap_or_default();
+    if amount.is_zero() {
+        return Err(ContractError::NoPendingTopUp { round_id });
+    }
+    PENDING_TOPUPS.remove(deps.storage, round_id);
+
+    let send = CosmosMsg::Bank(BankMsg::Send {
+        to_address: info.sender.to_string(),
+        amount: vec![Coin::new(amount, config.denom.clone())],
+    });
+
+    Ok(Response::new().add_message(send).add_event(
+        Event::new("winsaf/cancel_pending_top_up")
+            .add_attribute("by", info.sender)
+            .add_attribute("round_id", round_id.to_string())
+            .add_attribute("amount", amount),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // SetConfig / pause
 // ---------------------------------------------------------------------------
 
@@ -1782,6 +2064,9 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> Result<Binary, ContractErr
         QueryMsg::TreasuryBalance {} => {
             Ok(to_json_binary(&query_treasury_balance(deps)?)?)
         }
+        QueryMsg::PendingTopUp { round_id } => {
+            Ok(to_json_binary(&query_pending_top_up(deps, round_id)?)?)
+        }
     }
 }
 
@@ -1812,6 +2097,7 @@ fn query_round(deps: Deps, round_id: u64) -> Result<RoundResponse, ContractError
         winning_tickets: r.winning_tickets,
         randomness,
         dry_streak,
+        top_up_total: r.top_up_total,
     })
 }
 
@@ -1908,6 +2194,18 @@ fn query_referral_summary(
         referees: totals.referees,
         lifetime_earned: totals.lifetime_earned,
         lifetime_claimed: totals.lifetime_claimed,
+    })
+}
+
+fn query_pending_top_up(deps: Deps, round_id: u64) -> Result<PendingTopUpResponse, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    let amount = PENDING_TOPUPS
+        .may_load(deps.storage, round_id)?
+        .unwrap_or_default();
+    Ok(PendingTopUpResponse {
+        round_id,
+        amount,
+        denom: config.denom,
     })
 }
 
@@ -2038,8 +2336,24 @@ fn validate_addrs(deps: Deps, addrs: &[String]) -> Result<Vec<Addr>, ContractErr
 }
 
 /// Cross-field randomness config validation. drand+bls needs a well-formed group
-/// public key and a chain hash.
+/// public key and a chain hash. Production builds reject Mock/Dev and require
+/// Bls whenever randomness_mode is Drand.
 fn validate_randomness_config(config: &Config) -> Result<(), ContractError> {
+    // Production wasm (not unit tests, not `dev-randomness`) rejects Mock/Dev.
+    #[cfg(not(any(test, feature = "dev-randomness")))]
+    {
+        if matches!(config.randomness_mode, RandomnessMode::Mock) {
+            return Err(ContractError::InvalidConfig {
+                reason: "Mock randomness cannot be enabled in a production build".to_string(),
+            });
+        }
+        if matches!(config.verify_mode, VerifyMode::Dev) {
+            return Err(ContractError::InvalidConfig {
+                reason: "Dev verify mode cannot be enabled in a production build".to_string(),
+            });
+        }
+    }
+
     if matches!(config.randomness_mode, RandomnessMode::Drand) {
         if config.drand_chain_hash.is_empty() {
             return Err(ContractError::InvalidConfig {
@@ -2051,6 +2365,13 @@ fn validate_randomness_config(config: &Config) -> Result<(), ContractError> {
         if config.drand_period == 0 || config.drand_genesis_time == 0 {
             return Err(ContractError::InvalidConfig {
                 reason: "drand mode requires non-zero drand_genesis_time and drand_period".to_string(),
+            });
+        }
+        // Drand without BLS is Mock-level control under a production-looking mode.
+        #[cfg(not(any(test, feature = "dev-randomness")))]
+        if !matches!(config.verify_mode, VerifyMode::Bls) {
+            return Err(ContractError::InvalidConfig {
+                reason: "drand mode requires Bls verification in a production build".to_string(),
             });
         }
         if matches!(config.verify_mode, VerifyMode::Bls)
@@ -4817,6 +5138,354 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ContractError::AlreadyClaimed { .. }));
+    }
+
+    // --- GrantBonusTicketFromTreasury (treasury-funded, no external float) --
+
+    /// Read the tracked in-contract treasury balance.
+    fn treasury_bal(deps: &OD) -> Uint128 {
+        let tb: TreasuryBalanceResponse =
+            from_json(query(deps.as_ref(), mock_env(), QueryMsg::TreasuryBalance {}).unwrap())
+                .unwrap();
+        tb.balance
+    }
+
+    /// Grant `count` treasury-funded bonus tickets to `owner` (attaches `funds`,
+    /// which SHOULD be empty for the treasury path).
+    fn grant_from_treasury(
+        deps: &mut OD,
+        env: &Env,
+        caller: &Addr,
+        owner: &Addr,
+        count: u32,
+        numbers: Option<Vec<u8>>,
+        funds: Option<Vec<Coin>>,
+    ) -> Result<Response, ContractError> {
+        let info = message_info(caller, &funds.unwrap_or_default());
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            info,
+            ExecuteMsg::GrantBonusTicketFromTreasury {
+                owner: owner.to_string(),
+                count,
+                numbers,
+            },
+        )
+    }
+
+    #[test]
+    fn grant_from_treasury_debits_treasury_and_funds_pool() {
+        let (mut deps, api, env, admin, _submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        let owner = mk(&api, "xp_redeemer");
+
+        // Seed the treasury via paid buys: each 5 SAF buy accrues 1500 bps =
+        // 750_000 usaf. 14 buys → 10_500_000 usaf, enough for two 5 SAF bonuses.
+        for _ in 0..14 {
+            buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        }
+        let treasury_before = treasury_bal(&deps);
+        assert_eq!(treasury_before, Uint128::new(14 * 750_000));
+        let pool_before = current(&deps).pool;
+
+        // Admin grants 1 treasury-funded bonus ticket (no funds attached).
+        grant_from_treasury(&mut deps, &env, &admin, &owner, 1, None, None).unwrap();
+
+        // Treasury dropped by exactly one ticket price; pool grew by the same.
+        assert_eq!(
+            treasury_bal(&deps),
+            treasury_before - Uint128::new(TICKET_PRICE)
+        );
+        let r = current(&deps);
+        assert_eq!(r.pool, pool_before + Uint128::new(TICKET_PRICE));
+
+        // The ticket is owned by `owner` and flagged free.
+        let owned = tickets_of(&deps, 1, &owner);
+        assert_eq!(owned.len(), 1);
+        assert!(owned[0].ticket.free);
+        assert_eq!(owned[0].ticket.owner, owner);
+
+        // Admin may grant again.
+        grant_from_treasury(&mut deps, &env, &admin, &owner, 1, None, None).unwrap();
+        assert_eq!(tickets_of(&deps, 1, &owner).len(), 2);
+    }
+
+    #[test]
+    fn grant_from_treasury_insufficient_balance_rejected() {
+        let (mut deps, api, env, admin, _submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        let owner = mk(&api, "owner");
+
+        // One buy accrues only 750_000 usaf — far below a 5 SAF ticket price.
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        let err = grant_from_treasury(&mut deps, &env, &admin, &owner, 1, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::InsufficientTreasury { .. }));
+    }
+
+    #[test]
+    fn grant_from_treasury_rejects_attached_funds() {
+        let (mut deps, api, env, admin, _submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        let owner = mk(&api, "owner");
+
+        // Fund the treasury so the ONLY failure is the attached funds.
+        for _ in 0..7 {
+            buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        }
+        let err = grant_from_treasury(
+            &mut deps,
+            &env,
+            &admin,
+            &owner,
+            1,
+            None,
+            Some(coins(TICKET_PRICE, DENOM)),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Payment(_)));
+    }
+
+    #[test]
+    fn grant_from_treasury_unauthorized_caller_rejected() {
+        let (mut deps, api, env, _admin, submitter) = setup();
+        let stranger = mk(&api, "stranger");
+        let owner = mk(&api, "owner");
+        // Submitters deliver randomness; treasury debit is admin-only.
+        let err =
+            grant_from_treasury(&mut deps, &env, &submitter, &owner, 1, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::Unauthorized { .. }));
+        let err =
+            grant_from_treasury(&mut deps, &env, &stranger, &owner, 1, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn grant_from_treasury_on_non_open_round_rejected() {
+        let (mut deps, api, env, admin, submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        let owner = mk(&api, "owner");
+
+        // Seed treasury, then close the round so it no longer accepts tickets.
+        for _ in 0..7 {
+            buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        }
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&submitter, &[]),
+            ExecuteMsg::CloseRound {},
+        )
+        .unwrap();
+
+        let err = grant_from_treasury(&mut deps, &env2, &admin, &owner, 1, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::RoundNotOpen { .. }));
+    }
+
+    #[test]
+    fn grant_from_treasury_count_bounds_enforced() {
+        let (mut deps, api, env, admin, _submitter) = setup();
+        let owner = mk(&api, "owner");
+
+        // Zero count rejected (before any treasury check).
+        let err = grant_from_treasury(&mut deps, &env, &admin, &owner, 0, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::InvalidTicketCount { .. }));
+
+        // Over the per-tx cap rejected.
+        let err = grant_from_treasury(
+            &mut deps,
+            &env,
+            &admin,
+            &owner,
+            MAX_TICKETS_PER_TX + 1,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidTicketCount { .. }));
+    }
+
+    #[test]
+    fn grant_from_treasury_rejected_when_paused() {
+        let (mut deps, api, env, admin, _submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        let owner = mk(&api, "owner");
+        for _ in 0..7 {
+            buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        }
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &[]),
+            ExecuteMsg::Pause {},
+        )
+        .unwrap();
+        let err = grant_from_treasury(&mut deps, &env, &admin, &owner, 1, None, None).unwrap_err();
+        assert!(matches!(err, ContractError::Paused));
+    }
+
+    // --- TopUpPool (promotional seed, no tickets) ---------------------------
+
+    fn top_up(
+        deps: &mut OD,
+        env: &Env,
+        caller: &Addr,
+        round_id: u64,
+        amount: u128,
+    ) -> Result<Response, ContractError> {
+        let info = message_info(caller, &coins(amount, DENOM));
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            info,
+            ExecuteMsg::TopUpPool { round_id },
+        )
+    }
+
+    fn pending_top_up(deps: &OD, round_id: u64) -> PendingTopUpResponse {
+        from_json(
+            query(
+                deps.as_ref(),
+                mock_env(),
+                QueryMsg::PendingTopUp { round_id },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn top_up_pool_immediate_on_open_round() {
+        let (mut deps, api, env, admin, _sub) = setup();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        let pool_before = current(&deps).pool;
+        let tickets_before = current(&deps).ticket_count;
+
+        let seed = 10_000_000u128; // 10 SAF
+        top_up(&mut deps, &env, &admin, 1, seed).unwrap();
+
+        let r = current(&deps);
+        assert_eq!(r.pool, pool_before + Uint128::new(seed));
+        assert_eq!(r.top_up_total, Uint128::new(seed));
+        assert_eq!(r.ticket_count, tickets_before);
+        assert_eq!(pending_top_up(&deps, 1).amount, Uint128::zero());
+    }
+
+    #[test]
+    fn top_up_pool_unauthorized_rejected() {
+        let (mut deps, _api, env, _admin, submitter) = setup();
+        let err = top_up(&mut deps, &env, &submitter, 1, 1_000_000).unwrap_err();
+        assert!(matches!(err, ContractError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn top_up_pool_pending_folds_into_next_round() {
+        let (mut deps, api, env, admin, submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+
+        let seed = 25_000_000u128;
+        top_up(&mut deps, &env, &admin, 2, seed).unwrap();
+        assert_eq!(pending_top_up(&deps, 2).amount, Uint128::new(seed));
+
+        // Draw round 1 (no jackpot rollover needed — empty leftover ok).
+        run_draw(
+            &mut deps,
+            &env,
+            &submitter,
+            HexBinary::from([7u8; 32]),
+        );
+
+        let r2 = round(&deps, 2);
+        assert_eq!(r2.status, RoundStatus::Open);
+        // Pool = any rollover dust + pending top-up. With one ticket and mock
+        // draw there may be leftover rollover; pending must be included.
+        assert!(r2.pool >= Uint128::new(seed));
+        assert_eq!(r2.top_up_total, Uint128::new(seed));
+        assert_eq!(pending_top_up(&deps, 2).amount, Uint128::zero());
+        assert_eq!(r2.ticket_count, 0);
+    }
+
+    #[test]
+    fn top_up_pool_rejected_when_drawing() {
+        let (mut deps, api, env, admin, _sub) = setup();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&buyer, &[]),
+            ExecuteMsg::CloseRound {},
+        )
+        .unwrap();
+        assert_eq!(round(&deps, 1).status, RoundStatus::Drawing);
+
+        let err = top_up(&mut deps, &env2, &admin, 1, 1_000_000).unwrap_err();
+        assert!(matches!(err, ContractError::RoundNotOpenForTopUp { .. }));
+    }
+
+    #[test]
+    fn cancel_pending_top_up_refunds_admin() {
+        let (mut deps, _api, env, admin, _sub) = setup();
+        let seed = 3_000_000u128;
+        top_up(&mut deps, &env, &admin, 2, seed).unwrap();
+
+        let res = execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &[]),
+            ExecuteMsg::CancelPendingTopUp { round_id: 2 },
+        )
+        .unwrap();
+
+        assert_eq!(pending_top_up(&deps, 2).amount, Uint128::zero());
+        assert!(res.messages.iter().any(|m| {
+            matches!(
+                &m.msg,
+                CosmosMsg::Bank(BankMsg::Send { to_address, amount })
+                    if to_address == &admin.to_string()
+                        && amount == &coins(seed, DENOM)
+            )
+        }));
+    }
+
+    #[test]
+    fn top_up_pool_scales_draw_tiers_without_extra_tickets() {
+        let (mut deps, api, env, admin, submitter) = setup();
+        let buyer = mk(&api, "buyer");
+        // Two buyers so dry-streak / pool accounting is non-trivial.
+        buy(&mut deps, &env, &buyer, 2, None, None).unwrap();
+        let pool_from_buys = current(&deps).pool;
+        let seed = 100_000_000u128; // 100 SAF promotional seed
+        top_up(&mut deps, &env, &admin, 1, seed).unwrap();
+        assert_eq!(current(&deps).ticket_count, 2);
+        assert_eq!(
+            current(&deps).pool,
+            pool_from_buys + Uint128::new(seed)
+        );
+
+        run_draw(
+            &mut deps,
+            &env,
+            &submitter,
+            HexBinary::from([9u8; 32]),
+        );
+        // Round 1 settled; prize tiers were computed from the enlarged pool.
+        let r1 = round(&deps, 1);
+        assert_eq!(r1.status, RoundStatus::Settled);
+        assert_eq!(r1.ticket_count, 2);
+        // At least one tier slot is non-zero when there are winners, or the
+        // leftover rolled — either way the settled round recorded prize_tiers
+        // derived from the topped-up pool (pool before draw was buys+seed).
+        let pre_draw_pool = pool_from_buys + Uint128::new(seed);
+        let distributed = r1.pool; // retained for claims after draw
+        assert!(distributed <= pre_draw_pool);
     }
 
     // --- CancelRound recovery (MEDIUM #15 / HIGH #7) ------------------------

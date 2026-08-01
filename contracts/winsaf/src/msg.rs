@@ -36,9 +36,11 @@ pub struct InstantiateMsg {
     pub split: Option<FundSplitBps>,
     /// Rollover leftover pool to next round on no jackpot winner. `None` → true.
     pub rollover_on_no_winner: Option<bool>,
-    /// Randomness mechanism. `None` → `Mock`.
+    /// Randomness mechanism. `None` → `Drand` in production builds, `Mock` with
+    /// the `dev-randomness` feature.
     pub randomness_mode: Option<RandomnessMode>,
-    /// drand verification strategy. `None` → `Dev`.
+    /// drand verification strategy. `None` → `Bls` in production builds, `Dev`
+    /// with the `dev-randomness` feature.
     pub verify_mode: Option<VerifyMode>,
     /// drand group public key — required for drand + bls.
     pub drand_pubkey: Option<HexBinary>,
@@ -92,6 +94,24 @@ pub enum ExecuteMsg {
     /// picks for the FIRST ticket; remaining tickets (and all when omitted) are
     /// quick-picked — exactly like `BuyTickets`.
     GrantBonusTicket {
+        /// Beneficiary who OWNS the minted bonus tickets.
+        owner: String,
+        count: u32,
+        /// Explicit picks for the first ticket; `None` = quick-pick all.
+        numbers: Option<Vec<u8>>,
+    },
+
+    /// Admin-only: mint `count` bonus tickets OWNED BY `owner`, flagged free,
+    /// into the current open round, funded from the in-contract TREASURY balance
+    /// (NOT from attached funds). Backs the "redeem XP for a free ticket" feature
+    /// without any external SAF float: the caller sends NO funds, `count *
+    /// ticket_price` is debited from the treasury and added to the round pool so
+    /// the granted tickets are honestly funded and can win / be claimed by
+    /// `owner` like any paid ticket. Fails with `InsufficientTreasury` if the
+    /// treasury cannot cover the grant. Rejected while the contract is paused.
+    /// `numbers` (when provided) sets the picks for the FIRST ticket; the rest
+    /// are quick-picked — exactly like `GrantBonusTicket`.
+    GrantBonusTicketFromTreasury {
         /// Beneficiary who OWNS the minted bonus tickets.
         owner: String,
         count: u32,
@@ -161,6 +181,18 @@ pub enum ExecuteMsg {
 
     /// Admin-only: move `amount` usaf from the tracked treasury balance to `to`.
     WithdrawTreasury { to: String, amount: Uint128 },
+
+    /// Admin-only: seed a round's prize pool without minting tickets. Caller
+    /// attaches a non-zero amount of `denom`. If `round_id` is the current Open
+    /// round, funds are added to `round.pool` immediately. If `round_id` is a
+    /// future round (not yet opened), funds are escrowed and folded into that
+    /// round's pool when it opens. Rejected for Drawing/Settled/Cancelled or
+    /// past round ids. Tier BPS at draw are unchanged; absolute prizes scale.
+    TopUpPool { round_id: u64 },
+
+    /// Admin-only: refund escrowed `TopUpPool` funds for a future (not yet
+    /// opened) round back to the admin. No-op amount fails if nothing pending.
+    CancelPendingTopUp { round_id: u64 },
 
     /// Admin-only: update mutable config fields (any `None` field is unchanged).
     SetConfig {
@@ -239,6 +271,10 @@ pub enum QueryMsg {
     /// The in-contract treasury balance (usaf).
     #[returns(TreasuryBalanceResponse)]
     TreasuryBalance {},
+
+    /// Escrowed promotional seed for a round that has not opened yet.
+    #[returns(PendingTopUpResponse)]
+    PendingTopUp { round_id: u64 },
 }
 
 /// Migration parameters. All fields are optional; a bare `{}` performs a plain
@@ -297,6 +333,9 @@ pub struct RoundResponse {
     /// deserialize.
     #[serde(default)]
     pub dry_streak: u64,
+    /// Cumulative promotional top-up usaf for this round (included in `pool`).
+    #[serde(default)]
+    pub top_up_total: Uint128,
 }
 
 /// A ticket paired with its stable id (round-local sequence).
@@ -347,5 +386,13 @@ pub struct ReferralSummaryResponse {
 pub struct TreasuryBalanceResponse {
     /// In-contract treasury balance in usaf (withdrawable by the admin).
     pub balance: Uint128,
+    pub denom: String,
+}
+
+#[cw_serde]
+pub struct PendingTopUpResponse {
+    pub round_id: u64,
+    /// Escrowed usaf awaiting that round's open (zero if none).
+    pub amount: Uint128,
     pub denom: String,
 }

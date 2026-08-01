@@ -270,6 +270,11 @@ pub struct Round {
     /// open/drawing. `#[serde(default)]` so pre-upgrade rounds deserialize (0).
     #[serde(default)]
     pub dry_streak_after: u64,
+    /// Cumulative promotional `TopUpPool` usaf credited to this round (immediate
+    /// top-ups + escrow folded at open). Informational for the UI; already
+    /// included in `pool`. `#[serde(default)]` for pre-upgrade rounds.
+    #[serde(default)]
+    pub top_up_total: Uint128,
 }
 
 impl Round {
@@ -280,6 +285,18 @@ impl Round {
         closes_at: u64,
         pool: Uint128,
         rolled_over_from: Option<u64>,
+    ) -> Self {
+        Round::new_open_with_top_up(id, opens_at, closes_at, pool, rolled_over_from, Uint128::zero())
+    }
+
+    /// Like [`Self::new_open`] but records promotional seed folded from escrow.
+    pub fn new_open_with_top_up(
+        id: u64,
+        opens_at: u64,
+        closes_at: u64,
+        pool: Uint128,
+        rolled_over_from: Option<u64>,
+        top_up_total: Uint128,
     ) -> Self {
         Round {
             id,
@@ -295,6 +312,7 @@ impl Round {
             winning_tickets: 0,
             ticket_entropy: [0u8; 32],
             dry_streak_after: 0,
+            top_up_total,
         }
     }
 }
@@ -426,6 +444,10 @@ pub const PLAYERS: Map<(u64, &Addr), u8> = Map::new("players");
 /// The in-contract treasury balance (usaf). Accrues the treasury cut of each
 /// buy; decremented by admin `WithdrawTreasury`.
 pub const TREASURY: Item<Uint128> = Item::new("treasury");
+
+/// Escrowed promotional seed (`TopUpPool`) for rounds not yet opened.
+/// Key = future `round_id`. Folded into `Round.pool` in `open_next_round`.
+pub const PENDING_TOPUPS: Map<u64, Uint128> = Map::new("pending_topups");
 
 // --- Referral --------------------------------------------------------------
 
