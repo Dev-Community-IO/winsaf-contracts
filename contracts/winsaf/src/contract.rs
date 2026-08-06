@@ -2234,8 +2234,8 @@ pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> Result<Response, Co
     // Serde-default field additions (Config / Round / RandomnessRequest across the
     // security-hardening + rolldown upgrades) migrate WITHOUT an explicit data step
     // (reveal_timeout=0, open_code_registration=false, ticket_entropy=zero,
-    // committer/commit_height/reveal_deadline=None, max_dry_rounds=5, DRY_STREAK
-    // absent→0, Round.dry_streak_after=0). The admin should `SetConfig` a non-zero
+    // committer/commit_height/reveal_deadline=None, max_dry_rounds=0, DRY_STREAK
+    // absent→0, Round.dry_streak_after=0). The admin may `SetConfig` a non-zero
     // `reveal_timeout` post-migration.
     //
     // Optional config rewrites: adopt parameters `SetConfig` cannot change — the

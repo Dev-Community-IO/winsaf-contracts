@@ -94,7 +94,7 @@ DRAW_INTERVAL="${DRAW_INTERVAL:-300}"               # seconds/round (test cadenc
 NUMBER_MAX="${NUMBER_MAX:-45}"                       # real domain upper bound
 NUMBERS_PER_TICKET="${NUMBERS_PER_TICKET:-6}"        # picks per ticket
 TICKET_PRICE_USAF="${TICKET_PRICE_USAF:-5000000}"    # 5 SAF
-MAX_DRY_ROUNDS="${MAX_DRY_ROUNDS:-5}"                # forced jackpot rolldown cap
+MAX_DRY_ROUNDS="${MAX_DRY_ROUNDS:-0}"                # 0 = unlimited jackpot rollover until someone hits
 say "── instantiating winsaf (5 SAF · ${NUMBERS_PER_TICKET}·${NUMBER_MAX} · ${DRAW_INTERVAL}s · 75/10/15 · dry_cap=${MAX_DRY_ROUNDS} · randomness=${RMODE}) ──"
 INIT="$(jq -nc --arg a "$ADMIN" --arg s "$SUBMITTER" --arg m "$RMODE" --arg v "$VMODE" \
   --argjson di "$DRAW_INTERVAL" --argjson nm "$NUMBER_MAX" --argjson npt "$NUMBERS_PER_TICKET" \

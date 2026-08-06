@@ -168,23 +168,22 @@ pub struct Config {
     /// safe closed/admin-only behaviour on upgrade).
     #[serde(default)]
     pub open_code_registration: bool,
-    /// "Must Be Won" cap: the maximum number of consecutive dry rounds (no
-    /// match-6 jackpot winner) the jackpot allocation may roll over before it is
-    /// FORCED to roll DOWN to the best-matching lower tier present, guaranteeing
-    /// distribution. `0` disables the feature (unlimited rollover — the legacy
-    /// behaviour). Default 5.
+    /// Optional "Must Be Won" cap: max consecutive dry rounds (no match-6
+    /// jackpot winner) before the jackpot allocation is FORCED to roll DOWN to
+    /// the best-matching lower tier present. `0` = unlimited rollover (jackpot
+    /// rolls until someone hits). Default `0`.
     ///
     /// `#[serde(default = "default_max_dry_rounds")]` so a Config persisted by a
     /// pre-upgrade code version (which lacked this field) still deserializes
-    /// across a code migration, defaulting to 5.
+    /// across a code migration.
     #[serde(default = "default_max_dry_rounds")]
     pub max_dry_rounds: u64,
 }
 
-/// Default cap on consecutive dry rounds before a forced jackpot rolldown.
+/// Default `max_dry_rounds`: `0` = unlimited jackpot rollover until a 6-match hit.
 /// Also the serde default so pre-upgrade Configs deserialize with this value.
 pub fn default_max_dry_rounds() -> u64 {
-    5
+    0
 }
 
 impl Config {

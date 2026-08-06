@@ -61,8 +61,9 @@ pub struct InstantiateMsg {
     /// Allow permissionless `RegisterCode`. `None`/`false` → admin-only code
     /// registration (prevents referral-code squatting).
     pub open_code_registration: Option<bool>,
-    /// "Must Be Won" cap: max consecutive dry rounds before a forced jackpot
-    /// rolldown to the best present lower tier. `None` → 5. `0` disables it.
+    /// Optional "Must Be Won" cap. `None` → 0 (unlimited rollover). `0`
+    /// disables forced rolldown. Non-zero forces jackpot down after that many
+    /// dry rounds.
     pub max_dry_rounds: Option<u64>,
 }
 
@@ -212,8 +213,8 @@ pub enum ExecuteMsg {
         reveal_timeout: Option<u64>,
         /// Toggle permissionless referral-code registration.
         open_code_registration: Option<bool>,
-        /// "Must Be Won" cap: max consecutive dry rounds before a forced
-        /// jackpot rolldown. `0` disables the feature.
+        /// Optional "Must Be Won" cap. `0` = unlimited rollover (default).
+        /// Non-zero forces jackpot down after that many dry rounds.
         max_dry_rounds: Option<u64>,
         /// Submitters to ADD to the authorized set.
         add_submitters: Option<Vec<String>>,
@@ -293,7 +294,7 @@ pub struct MigrateMsg {
     /// Overwrite `Config.draw_interval` (seconds). Only affects rounds opened
     /// AFTER the migration — an already-open round keeps its fixed `closes_at`.
     pub draw_interval: Option<u64>,
-    /// Overwrite `Config.max_dry_rounds` (0 disables the forced-rolldown cap).
+    /// Overwrite `Config.max_dry_rounds` (`0` = unlimited jackpot rollover).
     pub max_dry_rounds: Option<u64>,
     /// Reset the global "Must Be Won" dry streak to 0 (clears an inflated streak
     /// accumulated before the empty/single-player-neutral fix).
