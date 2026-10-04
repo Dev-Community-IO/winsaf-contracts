@@ -481,6 +481,11 @@
                 "null"
               ]
             },
+            "clear_schedule_anchor": {
+              "description": "Clear the anchor and return to the floating schedule. Ignored when `schedule_anchor` is also set in the same call.",
+              "default": false,
+              "type": "boolean"
+            },
             "drand_chain_hash": {
               "type": [
                 "string",
@@ -522,7 +527,7 @@
               "minimum": 0.0
             },
             "max_dry_rounds": {
-              "description": "\"Must Be Won\" cap: max consecutive dry rounds before a forced jackpot rolldown. `0` disables the feature.",
+              "description": "Optional \"Must Be Won\" cap. `0` = unlimited rollover (default). Non-zero forces jackpot down after that many dry rounds.",
               "type": [
                 "integer",
                 "null"
@@ -581,6 +586,15 @@
                 "boolean",
                 "null"
               ]
+            },
+            "schedule_anchor": {
+              "description": "Set the fixed draw-schedule anchor (unix seconds). Takes effect for rounds opened AFTER this call; the open round keeps its `closes_at`.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
             },
             "split": {
               "anyOf": [

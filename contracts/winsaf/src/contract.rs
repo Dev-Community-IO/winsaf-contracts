@@ -21,16 +21,20 @@
 //!             (randomness fulfilled in-contract, verified per mode)
 //!   Drawing ──Draw──▶ Settled (prizes fixed, next round opened, maybe rollover)
 //!   Drawing ──CancelRound (randomness never fulfilled)──▶ Cancelled
-//!             (retained pool becomes pro-rata pull-refunds, next round opened)
+//!             (this round's ticket money becomes pro-rata pull-refunds; money
+//!              carried in from earlier rounds rolls forward; next round opened)
 //! ```
 //!
 //! # Randomness fairness & recommended production mode
 //!
-//! For PRODUCTION the recommended configuration is **Drand + BLS**
-//! (`randomness_mode = Drand`, `verify_mode = Bls`) wired to a real drand beacon
-//! (`drand_pubkey` + `drand_chain_hash`) and an actual relayer. In that mode the
-//! consumed randomness is an externally-verified beacon signature the submitter
-//! cannot grind — [`crate::verify::verify_drand`] enforces the BLS pairing.
+//! For PRODUCTION the configuration is **Drand + BLS** (`randomness_mode =
+//! Drand`, `verify_mode = Bls`) wired to drand quicknet (`drand_pubkey` +
+//! `drand_chain_hash`). Each round is bound at close to the first drand beacon
+//! published AFTER `closes_at`, which nobody (operator included) can know or
+//! influence in advance. [`crate::verify::verify_drand`] enforces the BLS
+//! pairing, so in this mode delivery is permissionless: anyone may relay the
+//! beacon, and nobody (admin included) may cancel the round early to discard an
+//! outcome.
 //!
 //! `CommitReveal` is a defense-in-depth fallback for testnet. It is hardened so a
 //! single submitter cannot pick the outcome: the finalised seed mixes a
@@ -51,9 +55,9 @@ use cw_storage_plus::Bound;
 use cw_utils::nonpayable;
 
 use winsaf_shared::{
-    assert_exact_usaf, must_pay_usaf_only, FundSplitBps, RoundStatus,
-    DEFAULT_DRAW_INTERVAL_SECONDS,
-    DEFAULT_NUMBER_MAX, DEFAULT_PICK_COUNT, DEFAULT_TICKET_PRICE_USAF, DENOM,
+    assert_exact_denom, must_pay_denom_only, FundSplitBps, RoundStatus,
+    DEFAULT_DRAW_INTERVAL_SECONDS, DEFAULT_NUMBER_MAX, DEFAULT_PICK_COUNT,
+    DEFAULT_TICKET_PRICE_USAF, DENOM,
 };
 
 use crate::error::ContractError;
@@ -178,11 +182,10 @@ pub fn instantiate(
         drand_period,
         authorized_submitters,
         min_claim_usaf: msg.min_claim_usaf.unwrap_or_default(),
-        reveal_timeout: msg
-            .reveal_timeout
-            .unwrap_or(DEFAULT_REVEAL_TIMEOUT_SECONDS),
+        reveal_timeout: msg.reveal_timeout.unwrap_or(DEFAULT_REVEAL_TIMEOUT_SECONDS),
         open_code_registration: msg.open_code_registration.unwrap_or(false),
         max_dry_rounds: msg.max_dry_rounds.unwrap_or_else(default_max_dry_rounds),
+        schedule_anchor: msg.schedule_anchor,
     };
     validate_randomness_config(&config)?;
     CONFIG.save(deps.storage, &config)?;
@@ -196,12 +199,7 @@ pub fn instantiate(
     // Open the first round (id 1).
     let round_id = 1u64;
     let opens_at = env.block.time.seconds();
-    let closes_at =
-        opens_at
-            .checked_add(draw_interval)
-            .ok_or_else(|| ContractError::InvalidConfig {
-                reason: "draw_interval overflows round close time".to_string(),
-            })?;
+    let closes_at = next_close_at(&config, opens_at)?;
     let round = Round::new_open(round_id, opens_at, closes_at, Uint128::zero(), None);
     ROUNDS.save(deps.storage, round_id, &round)?;
     CURRENT_ROUND.save(deps.storage, &round_id)?;
@@ -293,6 +291,8 @@ pub fn execute(
             reveal_timeout,
             open_code_registration,
             max_dry_rounds,
+            schedule_anchor,
+            clear_schedule_anchor,
             add_submitters,
             remove_submitters,
         } => execute_set_config(
@@ -314,6 +314,8 @@ pub fn execute(
                 reveal_timeout,
                 open_code_registration,
                 max_dry_rounds,
+                schedule_anchor,
+                clear_schedule_anchor,
                 add_submitters,
                 remove_submitters,
             },
@@ -346,12 +348,13 @@ fn execute_buy_tickets(
         });
     }
 
-    // Exact payment == count * ticket_price in usaf, and nothing else.
+    // Exact payment == count * ticket_price in this instance's settlement denom,
+    // and nothing else. A SAF instance rejects USDC and vice versa.
     let unit = config.ticket_price.amount;
     let total = unit
         .checked_mul(Uint128::from(count))
         .map_err(ContractError::Overflow)?;
-    assert_exact_usaf(&info.funds, total)?;
+    assert_exact_denom(&info.funds, &config.denom, total)?;
 
     let round_id = CURRENT_ROUND.load(deps.storage)?;
     let mut round = ROUNDS
@@ -439,9 +442,7 @@ fn execute_buy_tickets(
         )
         .add_attribute(
             "referrer",
-            credited_referrer
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
+            credited_referrer.map(|a| a.to_string()).unwrap_or_default(),
         )
         .add_attribute("pool", round.pool)
         .add_attribute("first_ticket_id", first_id)
@@ -605,14 +606,14 @@ fn execute_grant_bonus_ticket(
     // Validate / normalize the beneficiary address, like other addr params.
     let owner_addr = deps.api.addr_validate(&owner)?;
 
-    // Honesty funding: require exactly `count * ticket_price` usaf attached — the
-    // same guard a paid buy of `count` tickets uses — and add ALL of it to the
-    // pool so the bonus ticket is fully funded.
+    // Honesty funding: require exactly `count * ticket_price` in the settlement
+    // denom attached — the same guard a paid buy of `count` tickets uses — and
+    // add ALL of it to the pool so the bonus ticket is fully funded.
     let unit = config.ticket_price.amount;
     let total = unit
         .checked_mul(Uint128::from(count))
         .map_err(ContractError::Overflow)?;
-    assert_exact_usaf(&info.funds, total)?;
+    assert_exact_denom(&info.funds, &config.denom, total)?;
 
     let round_id = CURRENT_ROUND.load(deps.storage)?;
     let mut round = ROUNDS
@@ -831,9 +832,11 @@ fn execute_close_round(
     // so we keep `round_id` as an inert placeholder.
     let config = CONFIG.load(deps.storage)?;
     let beacon_round = match config.randomness_mode {
-        RandomnessMode::Drand => {
-            drand_round_after(round.closes_at, config.drand_genesis_time, config.drand_period)
-        }
+        RandomnessMode::Drand => drand_round_after(
+            round.closes_at,
+            config.drand_genesis_time,
+            config.drand_period,
+        ),
         _ => round_id,
     };
 
@@ -873,8 +876,12 @@ fn execute_submit_randomness(
 ) -> Result<Response, ContractError> {
     let config = CONFIG.load(deps.storage)?;
 
-    // Only authorized submitters (or the admin) may deliver randomness.
-    if !config.is_submitter(&info.sender) {
+    // A BLS-verified drand beacon proves itself: anyone may relay it, so the
+    // operator cannot delay or withhold a draw. Every other mode (mock, drand
+    // with the dev verifier) still requires an authorized submitter.
+    let self_verifying = matches!(config.randomness_mode, RandomnessMode::Drand)
+        && matches!(config.verify_mode, VerifyMode::Bls);
+    if !self_verifying && !config.is_submitter(&info.sender) {
         return Err(ContractError::UnauthorizedSubmitter);
     }
 
@@ -946,6 +953,11 @@ fn execute_commit_randomness(
     }
 
     let mut request = load_pending_randomness(deps.as_ref(), round_id)?;
+    // One commitment per round. Replacing it would let the submitter retry until
+    // it liked the outcome and keep pushing the reveal deadline back.
+    if matches!(request.status, RandomnessStatus::Committed) || request.commitment.is_some() {
+        return Err(ContractError::AlreadyCommitted { round_id });
+    }
     // Bind the commitment to its committer and record the commit height/time so
     // (a) only the same submitter may reveal, (b) the reveal is forced to a
     // strictly later block, and (c) a never-revealed commitment can be recovered
@@ -1201,16 +1213,12 @@ fn execute_draw(
                 .checked_add(prize)
                 .map_err(ContractError::Overflow)?;
         }
-        TICKETS.update(
-            deps.storage,
-            (round_id, id.as_str()),
-            |t| -> StdResult<_> {
-                let mut t = t.expect("ticket exists (iterated above)");
-                t.matches = *m;
-                t.prize = prize;
-                Ok(t)
-            },
-        )?;
+        TICKETS.update(deps.storage, (round_id, id.as_str()), |t| -> StdResult<_> {
+            let mut t = t.expect("ticket exists (iterated above)");
+            t.matches = *m;
+            t.prize = prize;
+            Ok(t)
+        })?;
     }
 
     // Pool accounting: distributed must never exceed the pool.
@@ -1307,6 +1315,50 @@ fn execute_draw(
     Ok(Response::new().add_event(event))
 }
 
+/// The `closes_at` for a round opening at `opens_at`.
+///
+/// Without `Config.schedule_anchor` this is the legacy `opens_at +
+/// draw_interval`, which drifts forward by the keeper latency between a round's
+/// close and the `Draw` that opens its successor. With an anchor the close snaps
+/// to the first grid point `anchor + k * draw_interval` strictly after
+/// `opens_at`, so the schedule is stable and two instances sharing an anchor
+/// draw together.
+///
+/// A round is never shorter than one full interval: if the next grid point is
+/// less than `draw_interval / 4` away (a draw landing just before a grid point),
+/// the following grid point is used so sales always have a usable window.
+fn next_close_at(config: &Config, opens_at: u64) -> Result<u64, ContractError> {
+    let interval = config.draw_interval;
+    let overflow = || ContractError::InvalidConfig {
+        reason: "draw_interval overflows round close time".to_string(),
+    };
+    let floating = opens_at.checked_add(interval).ok_or_else(overflow)?;
+
+    let Some(anchor) = config.schedule_anchor else {
+        return Ok(floating);
+    };
+    // Before the anchor, wait for the grid to start.
+    if anchor > opens_at {
+        return Ok(anchor);
+    }
+    // First grid point strictly after `opens_at`.
+    let elapsed = opens_at - anchor;
+    let steps = elapsed
+        .checked_div(interval)
+        .ok_or_else(overflow)?
+        .checked_add(1)
+        .ok_or_else(overflow)?;
+    let mut candidate = steps
+        .checked_mul(interval)
+        .and_then(|off| anchor.checked_add(off))
+        .ok_or_else(overflow)?;
+    // Guarantee a usable sales window.
+    if candidate - opens_at < interval / 4 {
+        candidate = candidate.checked_add(interval).ok_or_else(overflow)?;
+    }
+    Ok(candidate)
+}
+
 /// Open the round following `prev_id`, seeded with `rollover_amount`, and make it
 /// the current round. Shared by `execute_draw` (settle) and `execute_cancel_round`
 /// (recovery) so the lifecycle always advances and never permanently halts.
@@ -1323,11 +1375,7 @@ fn open_next_round(
         .ok_or_else(|| ContractError::InvalidConfig {
             reason: "round id overflow".to_string(),
         })?;
-    let closes_at = now
-        .checked_add(config.draw_interval)
-        .ok_or_else(|| ContractError::InvalidConfig {
-            reason: "draw_interval overflows round close time".to_string(),
-        })?;
+    let closes_at = next_close_at(config, now)?;
     let rolled_from = if rollover_amount.is_zero() {
         None
     } else {
@@ -1343,14 +1391,8 @@ fn open_next_round(
     let seed = rollover_amount
         .checked_add(pending)
         .map_err(ContractError::Overflow)?;
-    let next_round = Round::new_open_with_top_up(
-        next_id,
-        now,
-        closes_at,
-        seed,
-        rolled_from,
-        pending,
-    );
+    let next_round =
+        Round::new_open_with_top_up(next_id, now, closes_at, seed, rolled_from, pending);
     ROUNDS.save(storage, next_id, &next_round)?;
     TICKET_SEQ.save(storage, next_id, &0u64)?;
     CURRENT_ROUND.save(storage, &next_id)?;
@@ -1365,19 +1407,25 @@ fn open_next_round(
 /// never trapped and the protocol never halts on an unfulfillable round.
 ///
 /// Authorization / timing:
-///   - the admin may cancel a stuck `Drawing` round at any time, OR
-///   - anyone may cancel once EITHER the commit-reveal `reveal_deadline` has
-///     passed OR `closes_at + CANCEL_GRACE_SECONDS` has elapsed.
+///   - drand + BLS mode: anyone (the admin included) may cancel only once
+///     `closes_at + CANCEL_GRACE_SECONDS` has elapsed. The beacon is public a few
+///     seconds after close and anyone can relay it, so an early cancel could only
+///     serve to discard an outcome someone dislikes.
+///   - other modes: the admin may cancel a stuck round at any time; anyone may
+///     once EITHER the commit-reveal `reveal_deadline` has passed OR
+///     `closes_at + CANCEL_GRACE_SECONDS` has elapsed.
 /// A round whose randomness is already `Fulfilled` must be drawn, not cancelled.
 ///
 /// Effect:
 ///   - marks the round `Cancelled`,
-///   - converts the retained `pool` into a pro-rata pull-refund per ticket
+///   - refunds ONLY what this round's tickets paid into the pool
+///     (`Round::ticket_contributions`), pro-rata per ticket as a pull-refund
 ///     (assigned to `Ticket.prize`, claimed via `ClaimReward`, double-refund
-///     guarded by `Ticket.claimed`) — capped at funds actually held so no
-///     underflow can occur, and
-///   - opens the next round (carrying any un-refundable rounding dust as
-///     rollover) so `CURRENT_ROUND` advances and sales resume.
+///     guarded by `Ticket.claimed`),
+///   - carries everything else (rollover from earlier rounds, promotional
+///     top-ups, rounding dust) into the next round, so a cancel can never hand
+///     the accumulated jackpot to the cancelled round's buyers, and
+///   - opens the next round so `CURRENT_ROUND` advances and sales resume.
 fn execute_cancel_round(
     deps: DepsMut,
     env: Env,
@@ -1408,10 +1456,22 @@ fn execute_cancel_round(
         }
     }
 
-    // Authorization: admin any time; otherwise a timeout must have passed.
+    // Authorization: see the doc comment. In self-verifying drand mode nobody
+    // gets an early cancel; otherwise the admin may cancel any time.
     let now = env.block.time.seconds();
     let is_admin = config.is_admin(&info.sender);
-    if !is_admin {
+    let self_verifying = matches!(config.randomness_mode, RandomnessMode::Drand)
+        && matches!(config.verify_mode, VerifyMode::Bls);
+    if self_verifying {
+        let grace_passed = now >= round.closes_at.saturating_add(CANCEL_GRACE_SECONDS);
+        if !grace_passed {
+            return Err(ContractError::CannotCancel {
+                round_id,
+                reason: "drand beacon can still be delivered; cancel opens after the grace period"
+                    .to_string(),
+            });
+        }
+    } else if !is_admin {
         let reveal_deadline_passed = request
             .as_ref()
             .and_then(|r| r.reveal_deadline)
@@ -1426,17 +1486,20 @@ fn execute_cancel_round(
         }
     }
 
-    // Trustless pro-rata refund: only the prize cut reached `round.pool`
-    // (treasury/referral already left it), so we can only repay from what is
-    // held. Distribute the retained pool evenly across tickets, floor-divided;
-    // this caps total refunds at `pool` so `PoolUnderflow` can never trigger. Any
-    // rounding dust rolls to the next round.
+    // Trustless pro-rata refund of THIS round's ticket money only: the prize cut
+    // (and any folded referral cut) its tickets paid in. Treasury/referral cuts
+    // already left the pool, and money carried in from earlier rounds or added
+    // as a promotional top-up is not this round's buyers' to take. Floor
+    // division caps refunds at `contributions`, so `PoolUnderflow` can never
+    // trigger; the remainder rolls forward.
     let ticket_count = round.ticket_count;
     let pool = round.pool;
+    let contributions = round.ticket_contributions();
     let per_ticket = if ticket_count == 0 {
         Uint128::zero()
     } else {
-        pool.checked_div(Uint128::from(ticket_count))
+        contributions
+            .checked_div(Uint128::from(ticket_count))
             .unwrap_or_default()
     };
 
@@ -1447,26 +1510,25 @@ fn execute_cancel_round(
             .keys(deps.storage, None, None, Order::Ascending)
             .collect::<StdResult<_>>()?;
         for id in &ids {
-            TICKETS.update(
-                deps.storage,
-                (round_id, id.as_str()),
-                |t| -> StdResult<_> {
-                    let mut t = t.expect("ticket exists (iterated above)");
-                    // Refund overrides any (non-existent) prize; not yet claimed.
-                    t.prize = per_ticket;
-                    t.matches = 0;
-                    t.claimed = false;
-                    Ok(t)
-                },
-            )?;
+            TICKETS.update(deps.storage, (round_id, id.as_str()), |t| -> StdResult<_> {
+                let mut t = t.expect("ticket exists (iterated above)");
+                // Refund overrides any (non-existent) prize; not yet claimed.
+                t.prize = per_ticket;
+                t.matches = 0;
+                t.claimed = false;
+                Ok(t)
+            })?;
             assigned = assigned
                 .checked_add(per_ticket)
                 .map_err(ContractError::Overflow)?;
         }
     }
 
-    // Dust that can't be refunded (rounding remainder) rolls into the next round.
-    let dust = pool.checked_sub(assigned).map_err(ContractError::Overflow)?;
+    // Everything not refunded (carried-in rollover, top-ups, rounding dust)
+    // rolls into the next round.
+    let carried = pool
+        .checked_sub(assigned)
+        .map_err(ContractError::Overflow)?;
 
     round.status = RoundStatus::Cancelled;
     // Retain exactly the assigned refunds on this round to back pull-claims.
@@ -1474,7 +1536,7 @@ fn execute_cancel_round(
     ROUNDS.save(deps.storage, round_id, &round)?;
 
     // CRITICAL for liveness: advance the lifecycle so future rounds/sales resume.
-    let next_id = open_next_round(deps.storage, round_id, &config, now, dust)?;
+    let next_id = open_next_round(deps.storage, round_id, &config, now, carried)?;
 
     let event = Event::new("winsaf/cancel")
         .add_attribute("round_id", round_id.to_string())
@@ -1482,7 +1544,7 @@ fn execute_cancel_round(
         .add_attribute("admin", is_admin.to_string())
         .add_attribute("refund_per_ticket", per_ticket)
         .add_attribute("refund_total", assigned)
-        .add_attribute("rollover_dust", dust)
+        .add_attribute("carried_forward", carried)
         .add_attribute("next_round_id", next_id.to_string());
 
     Ok(Response::new().add_event(event))
@@ -1628,7 +1690,9 @@ fn execute_register_code(
         // (default), only the admin may claim a NEW code, so reserved
         // brand/influencer codes cannot be front-run. Owners may still
         // re-register (idempotently) their existing codes above regardless.
-        return Err(ContractError::unauthorized("admin (code registration is closed)"));
+        return Err(ContractError::unauthorized(
+            "admin (code registration is closed)",
+        ));
     }
     REFERRAL_CODES.save(deps.storage, &normalized, &info.sender)?;
 
@@ -1734,7 +1798,7 @@ fn execute_top_up_pool(
         return Err(ContractError::unauthorized("admin"));
     }
 
-    let amount = must_pay_usaf_only(&info.funds)?;
+    let amount = must_pay_denom_only(&info.funds, &config.denom)?;
 
     if let Some(mut round) = ROUNDS.may_load(deps.storage, round_id)? {
         if !round.status.accepts_tickets() {
@@ -1847,6 +1911,8 @@ struct SetConfigArgs {
     reveal_timeout: Option<u64>,
     open_code_registration: Option<bool>,
     max_dry_rounds: Option<u64>,
+    schedule_anchor: Option<u64>,
+    clear_schedule_anchor: bool,
     add_submitters: Option<Vec<String>>,
     remove_submitters: Option<Vec<String>>,
 }
@@ -1991,6 +2057,14 @@ fn execute_set_config(
         config.max_dry_rounds = mdr;
         changed.push(Attribute::new("max_dry_rounds", mdr.to_string()));
     }
+    // Setting an anchor wins over clearing it, so a single call is unambiguous.
+    if let Some(anchor) = args.schedule_anchor {
+        config.schedule_anchor = Some(anchor);
+        changed.push(Attribute::new("schedule_anchor", anchor.to_string()));
+    } else if args.clear_schedule_anchor {
+        config.schedule_anchor = None;
+        changed.push(Attribute::new("schedule_anchor", "cleared"));
+    }
     if let Some(add) = args.add_submitters {
         for a in add {
             let addr = deps.api.addr_validate(&a)?;
@@ -2061,9 +2135,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> Result<Binary, ContractErr
         QueryMsg::ReferralSummary { addr } => {
             Ok(to_json_binary(&query_referral_summary(deps, addr)?)?)
         }
-        QueryMsg::TreasuryBalance {} => {
-            Ok(to_json_binary(&query_treasury_balance(deps)?)?)
-        }
+        QueryMsg::TreasuryBalance {} => Ok(to_json_binary(&query_treasury_balance(deps)?)?),
         QueryMsg::PendingTopUp { round_id } => {
             Ok(to_json_binary(&query_pending_top_up(deps, round_id)?)?)
         }
@@ -2098,6 +2170,7 @@ fn query_round(deps: Deps, round_id: u64) -> Result<RoundResponse, ContractError
         randomness,
         dry_streak,
         top_up_total: r.top_up_total,
+        rollover_in: r.rollover_in,
     })
 }
 
@@ -2268,8 +2341,85 @@ pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> Result<Response, Co
         config.max_dry_rounds = mdr;
         config_changed = true;
     }
+    if let Some(anchor) = msg.schedule_anchor {
+        config.schedule_anchor = Some(anchor);
+        config_changed = true;
+    }
+
+    // Randomness mechanism switch (e.g. commit-reveal -> drand). Only safe while
+    // no draw is in flight: the current round must still be open, with no
+    // randomness requested. Its close then binds the new mechanism.
+    let randomness_switch = msg.randomness_mode.is_some()
+        || msg.verify_mode.is_some()
+        || msg.drand_pubkey.is_some()
+        || msg.drand_chain_hash.is_some()
+        || msg.drand_genesis_time.is_some()
+        || msg.drand_period.is_some();
+    if randomness_switch {
+        let current_id = CURRENT_ROUND.load(deps.storage)?;
+        let current_round = ROUNDS.load(deps.storage, current_id)?;
+        if !current_round.status.accepts_tickets()
+            || RANDOMNESS.may_load(deps.storage, current_id)?.is_some()
+        {
+            return Err(ContractError::MigrationBlocked {
+                reason: format!(
+                    "round {current_id} has a draw in flight; switch randomness while it is open"
+                ),
+            });
+        }
+        if let Some(mode) = msg.randomness_mode {
+            config.randomness_mode = mode;
+        }
+        if let Some(verify) = msg.verify_mode {
+            config.verify_mode = verify;
+        }
+        if let Some(pk) = msg.drand_pubkey {
+            config.drand_pubkey = pk;
+        }
+        if let Some(hash) = msg.drand_chain_hash {
+            config.drand_chain_hash = hash;
+        }
+        if let Some(genesis) = msg.drand_genesis_time {
+            config.drand_genesis_time = genesis;
+        }
+        if let Some(period) = msg.drand_period {
+            config.drand_period = period;
+        }
+        // Drand needs genesis/period to bind the future beacon; default to
+        // quicknet when the stored config never had them (commit-reveal era).
+        if matches!(config.randomness_mode, RandomnessMode::Drand) {
+            if config.drand_genesis_time == 0 {
+                config.drand_genesis_time = DRAND_QUICKNET_GENESIS;
+            }
+            if config.drand_period == 0 {
+                config.drand_period = DRAND_QUICKNET_PERIOD;
+            }
+        }
+        validate_randomness_config(&config)?;
+        config_changed = true;
+    }
+
     if config_changed {
         CONFIG.save(deps.storage, &config)?;
+    }
+
+    // Backfill how much of the current round's pool was carried in from earlier
+    // rounds (rounds opened before `rollover_in` existed default to zero).
+    let mut rollover_backfill = Uint128::zero();
+    if let Some(rollover_in) = msg.current_round_rollover_in {
+        let current_id = CURRENT_ROUND.load(deps.storage)?;
+        let mut current_round = ROUNDS.load(deps.storage, current_id)?;
+        let carried_max = current_round.pool.saturating_sub(current_round.top_up_total);
+        if rollover_in > carried_max {
+            return Err(ContractError::MigrationBlocked {
+                reason: format!(
+                    "rollover_in {rollover_in} exceeds round {current_id} pool minus top-ups ({carried_max})"
+                ),
+            });
+        }
+        current_round.rollover_in = rollover_in;
+        ROUNDS.save(deps.storage, current_id, &current_round)?;
+        rollover_backfill = rollover_in;
     }
 
     // Optionally clear an inflated "Must Be Won" streak (pre-fix empty rounds).
@@ -2285,7 +2435,18 @@ pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> Result<Response, Co
             .add_attribute("config_rewritten", config_changed.to_string())
             .add_attribute("number_max", config.number_max.to_string())
             .add_attribute("draw_interval", config.draw_interval.to_string())
-            .add_attribute("dry_streak_reset", msg.reset_dry_streak.to_string()),
+            .add_attribute(
+                "schedule_anchor",
+                config
+                    .schedule_anchor
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            )
+            .add_attribute("dry_streak_reset", msg.reset_dry_streak.to_string())
+            .add_attribute("randomness_mode", config.randomness_mode.as_str())
+            .add_attribute("verify_mode", verify_mode_str(&config.verify_mode))
+            .add_attribute("drand_chain_hash", config.drand_chain_hash.clone())
+            .add_attribute("rollover_backfill", rollover_backfill),
     ))
 }
 
@@ -2364,7 +2525,8 @@ fn validate_randomness_config(config: &Config) -> Result<(), ContractError> {
         // genesis/period, so both must be set for the future-round binding to work.
         if config.drand_period == 0 || config.drand_genesis_time == 0 {
             return Err(ContractError::InvalidConfig {
-                reason: "drand mode requires non-zero drand_genesis_time and drand_period".to_string(),
+                reason: "drand mode requires non-zero drand_genesis_time and drand_period"
+                    .to_string(),
             });
         }
         // Drand without BLS is Mock-level control under a production-looking mode.
@@ -2374,9 +2536,7 @@ fn validate_randomness_config(config: &Config) -> Result<(), ContractError> {
                 reason: "drand mode requires Bls verification in a production build".to_string(),
             });
         }
-        if matches!(config.verify_mode, VerifyMode::Bls)
-            && config.drand_pubkey.len() != G2_LEN
-        {
+        if matches!(config.verify_mode, VerifyMode::Bls) && config.drand_pubkey.len() != G2_LEN {
             return Err(ContractError::InvalidPubkey {
                 reason: format!(
                     "drand mode with BLS verification requires a {G2_LEN}-byte G2 public key"
@@ -2474,7 +2634,8 @@ fn quick_pick(env: &Env, sender: &Addr, round_id: u64, seq: u64, config: &Config
 /// which is not known when a commit-reveal submitter must post their commitment
 /// during the `Open` phase — so it cannot be ground offline to steer the draw.
 fn fold_ticket_entropy(prev: &[u8; 32], buyer: &Addr, ticket_id: &str, picks: &[u8]) -> [u8; 32] {
-    let mut buf: Vec<u8> = Vec::with_capacity(32 + buyer.as_bytes().len() + ticket_id.len() + picks.len());
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(32 + buyer.as_bytes().len() + ticket_id.len() + picks.len());
     buf.extend_from_slice(prev);
     buf.extend_from_slice(buyer.as_bytes());
     buf.extend_from_slice(ticket_id.as_bytes());
@@ -2537,10 +2698,7 @@ fn count_matches(picks: &[u8], winning: &[u8]) -> u8 {
 
 /// Load the randomness slot for a round, requiring it to exist and not be
 /// already fulfilled.
-fn load_pending_randomness(
-    deps: Deps,
-    round_id: u64,
-) -> Result<RandomnessRequest, ContractError> {
+fn load_pending_randomness(deps: Deps, round_id: u64) -> Result<RandomnessRequest, ContractError> {
     let request = RANDOMNESS
         .may_load(deps.storage, round_id)?
         .ok_or(ContractError::RoundNotFound { round_id })?;
@@ -2780,6 +2938,7 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: None,
+            schedule_anchor: None,
         };
         let info = message_info(&admin, &[]);
         instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
@@ -2921,6 +3080,7 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: None,
+            schedule_anchor: None,
         };
         instantiate(deps.as_mut(), mock_env(), message_info(&sender, &[]), msg).unwrap();
         let c: Config =
@@ -2953,9 +3113,10 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: None,
+            schedule_anchor: None,
         };
-        let err = instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
-            .unwrap_err();
+        let err =
+            instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg).unwrap_err();
         assert!(matches!(err, ContractError::InvalidConfig { .. }));
     }
 
@@ -2983,9 +3144,10 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: None,
+            schedule_anchor: None,
         };
-        let err = instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
-            .unwrap_err();
+        let err =
+            instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg).unwrap_err();
         assert!(matches!(err, ContractError::Shared(_)));
     }
 
@@ -3014,14 +3176,10 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: None,
+            schedule_anchor: None,
         };
-        let err = instantiate(
-            deps.as_mut(),
-            mock_env(),
-            message_info(&admin, &[]),
-            msg,
-        )
-        .unwrap_err();
+        let err =
+            instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg).unwrap_err();
         assert!(matches!(err, ContractError::InvalidConfig { .. }));
 
         // Bad pubkey length.
@@ -3045,14 +3203,10 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: None,
+            schedule_anchor: None,
         };
-        let err = instantiate(
-            deps.as_mut(),
-            mock_env(),
-            message_info(&admin, &[]),
-            msg,
-        )
-        .unwrap_err();
+        let err =
+            instantiate(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg).unwrap_err();
         assert!(matches!(err, ContractError::InvalidPubkey { .. }));
     }
 
@@ -3226,13 +3380,14 @@ mod tests {
     fn buy_too_many_rejected() {
         let (mut deps, api, env, _admin, _sub) = setup();
         let buyer = mk(&api, "buyer");
-        let info = message_info(&buyer, &coins(TICKET_PRICE * 101, DENOM));
+        let over = MAX_TICKETS_PER_TX + 1;
+        let info = message_info(&buyer, &coins(TICKET_PRICE * over as u128, DENOM));
         let err = execute(
             deps.as_mut(),
             env,
             info,
             ExecuteMsg::BuyTickets {
-                count: 101,
+                count: over,
                 numbers: None,
                 referral_code: None,
             },
@@ -3251,7 +3406,15 @@ mod tests {
         assert!(matches!(err, ContractError::InvalidNumbers { .. }));
 
         // Valid, unsorted -> stored sorted.
-        buy(&mut deps, &env, &buyer, 1, Some(vec![6, 5, 4, 3, 2, 1]), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(vec![6, 5, 4, 3, 2, 1]),
+            None,
+        )
+        .unwrap();
         let tickets: TicketsResponse = from_json(
             query(
                 deps.as_ref(),
@@ -3274,8 +3437,15 @@ mod tests {
     fn buy_duplicate_numbers_rejected() {
         let (mut deps, api, env, _admin, _sub) = setup();
         let buyer = mk(&api, "buyer");
-        let err = buy(&mut deps, &env, &buyer, 1, Some(vec![1, 1, 2, 3, 4, 5]), None)
-            .unwrap_err();
+        let err = buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(vec![1, 1, 2, 3, 4, 5]),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ContractError::InvalidNumbers { .. }));
     }
 
@@ -3283,8 +3453,15 @@ mod tests {
     fn buy_out_of_range_number_rejected() {
         let (mut deps, api, env, _admin, _sub) = setup();
         let buyer = mk(&api, "buyer");
-        let err = buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 46]), None)
-            .unwrap_err();
+        let err = buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(vec![1, 2, 3, 4, 5, 46]),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ContractError::InvalidNumbers { .. }));
     }
 
@@ -3292,7 +3469,15 @@ mod tests {
     fn buy_first_ticket_custom_rest_quickpicked() {
         let (mut deps, api, env, _admin, _sub) = setup();
         let buyer = mk(&api, "buyer");
-        buy(&mut deps, &env, &buyer, 3, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            3,
+            Some(vec![1, 2, 3, 4, 5, 6]),
+            None,
+        )
+        .unwrap();
         let tickets: TicketsResponse = from_json(
             query(
                 deps.as_ref(),
@@ -3501,13 +3686,7 @@ mod tests {
             submit.clone(),
         )
         .unwrap();
-        let err = execute(
-            deps.as_mut(),
-            env2,
-            message_info(&submitter, &[]),
-            submit,
-        )
-        .unwrap_err();
+        let err = execute(deps.as_mut(), env2, message_info(&submitter, &[]), submit).unwrap_err();
         assert!(matches!(err, ContractError::AlreadyFulfilled { .. }));
     }
 
@@ -3584,6 +3763,7 @@ mod tests {
                 reveal_timeout: None,
                 open_code_registration: None,
                 max_dry_rounds: None,
+                schedule_anchor: None,
             },
         )
         .unwrap();
@@ -3680,6 +3860,8 @@ mod tests {
                 reveal_timeout: None,
                 open_code_registration: None,
                 max_dry_rounds: None,
+                schedule_anchor: None,
+                clear_schedule_anchor: false,
                 add_submitters: Some(vec![other.to_string()]),
                 remove_submitters: None,
             },
@@ -3716,10 +3898,7 @@ mod tests {
         preimage.extend_from_slice(&[0u8; 32]); // no tickets bought => zero entropy
         preimage.extend_from_slice(&env3.block.time.seconds().to_be_bytes());
         preimage.extend_from_slice(&env3.block.height.to_be_bytes());
-        assert_eq!(
-            req.randomness.unwrap(),
-            HexBinary::from(sha256(&preimage))
-        );
+        assert_eq!(req.randomness.unwrap(), HexBinary::from(sha256(&preimage)));
         // The hardened seed differs from the naive sha256(value).
         assert_ne!(
             HexBinary::from(sha256(&preimage)),
@@ -3786,11 +3965,22 @@ mod tests {
         // Buy tickets that (almost certainly) don't hit the jackpot: use a low
         // fixed set; if it happens to match the derived winners the assertion
         // below tolerates it via the branch on jackpot count.
-        buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(vec![1, 2, 3, 4, 5, 6]),
+            None,
+        )
+        .unwrap();
 
         let randomness = HexBinary::from(vec![0x11u8; 32]);
         let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
-        let matches = winning.iter().filter(|w| [1, 2, 3, 4, 5, 6].contains(w)).count();
+        let matches = winning
+            .iter()
+            .filter(|w| [1, 2, 3, 4, 5, 6].contains(w))
+            .count();
 
         run_draw(&mut deps, &env, &submitter, randomness);
 
@@ -3838,13 +4028,27 @@ mod tests {
                 reveal_timeout: None,
                 open_code_registration: None,
                 max_dry_rounds: None,
+                schedule_anchor: None,
             },
         )
         .unwrap();
         let buyer = mk(&api, "buyer");
-        buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(vec![1, 2, 3, 4, 5, 6]),
+            None,
+        )
+        .unwrap();
 
-        run_draw(&mut deps, &env, &submitter, HexBinary::from(vec![0x22u8; 32]));
+        run_draw(
+            &mut deps,
+            &env,
+            &submitter,
+            HexBinary::from(vec![0x22u8; 32]),
+        );
         let r2 = round(&deps, 2);
         assert_eq!(r2.rolled_over_from, None);
         assert_eq!(r2.pool, Uint128::zero());
@@ -3880,6 +4084,7 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: Some(max_dry_rounds),
+            schedule_anchor: None,
         };
         instantiate(deps.as_mut(), env.clone(), message_info(&admin, &[]), msg).unwrap();
         (deps, api, env, admin, submitter)
@@ -3959,12 +4164,34 @@ mod tests {
             let round_id = (i + 1) as u64;
             let randomness = HexBinary::from(vec![*b; 32]);
             let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
-            buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&winning, 5)), None).unwrap();
-            buy(&mut deps, &env, &filler, 1, Some(picks_matching(&winning, 0)), None).unwrap();
+            buy(
+                &mut deps,
+                &env,
+                &buyer,
+                1,
+                Some(picks_matching(&winning, 5)),
+                None,
+            )
+            .unwrap();
+            buy(
+                &mut deps,
+                &env,
+                &filler,
+                1,
+                Some(picks_matching(&winning, 0)),
+                None,
+            )
+            .unwrap();
             if round_id == 3 {
                 r1_pool_pre = round(&deps, 3).pool; // pre-draw pool of round 3
             }
-            run_draw_round(&mut deps, &mut env, &submitter, round_id, randomness.clone());
+            run_draw_round(
+                &mut deps,
+                &mut env,
+                &submitter,
+                round_id,
+                randomness.clone(),
+            );
         }
 
         // Rounds 1 & 2 were dry with no forced rolldown: they rolled over.
@@ -4008,16 +4235,48 @@ mod tests {
         // Round 1: dry (match 4 only) -> streak 1.
         let rnd1 = HexBinary::from(vec![0x41; 32]);
         let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w1, 4)), None).unwrap();
-        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w1, 0)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&w1, 4)),
+            None,
+        )
+        .unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &filler,
+            1,
+            Some(picks_matching(&w1, 0)),
+            None,
+        )
+        .unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
         assert_eq!(round(&deps, 1).dry_streak, 1);
 
         // Round 2: dry again -> streak 2.
         let rnd2 = HexBinary::from(vec![0x42; 32]);
         let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 4)), None).unwrap();
-        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w2, 0)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&w2, 4)),
+            None,
+        )
+        .unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &filler,
+            1,
+            Some(picks_matching(&w2, 0)),
+            None,
+        )
+        .unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
         assert_eq!(round(&deps, 2).dry_streak, 2);
 
@@ -4025,7 +4284,15 @@ mod tests {
         let rnd3 = HexBinary::from(vec![0x43; 32]);
         let w3 = derive_winning_numbers(rnd3.as_slice(), 6, 45);
         buy(&mut deps, &env, &buyer, 1, Some(w3.clone()), None).unwrap();
-        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w3, 0)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &filler,
+            1,
+            Some(picks_matching(&w3, 0)),
+            None,
+        )
+        .unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 3, rnd3);
         let r3 = round(&deps, 3);
         assert!(r3.prize_tiers.tier_6 > Uint128::zero()); // jackpot actually paid
@@ -4045,16 +4312,48 @@ mod tests {
         // Round 1: dry, no lower-tier winner (match 0) -> streak 1.
         let rnd1 = HexBinary::from(vec![0x51; 32]);
         let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w1, 0)), None).unwrap();
-        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w1, 0)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&w1, 0)),
+            None,
+        )
+        .unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &filler,
+            1,
+            Some(picks_matching(&w1, 0)),
+            None,
+        )
+        .unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
         assert_eq!(round(&deps, 1).dry_streak, 1);
 
         // Round 2: hits the cap and would force, but NO ticket matches >= 3.
         let rnd2 = HexBinary::from(vec![0x52; 32]);
         let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 0)), None).unwrap();
-        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w2, 0)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&w2, 0)),
+            None,
+        )
+        .unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &filler,
+            1,
+            Some(picks_matching(&w2, 0)),
+            None,
+        )
+        .unwrap();
         let pool_pre = round(&deps, 2).pool;
         run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
 
@@ -4063,7 +4362,7 @@ mod tests {
         assert_eq!(r2.winning_tickets, 0);
         assert_eq!(r2.dry_streak, 2); // NOT reset — no forced payout possible
         assert_eq!(r2.pool, Uint128::zero()); // retained pool = distributed = 0
-        // The full pool rolled over to round 3 (rollover enabled).
+                                              // The full pool rolled over to round 3 (rollover enabled).
         assert_eq!(round(&deps, 3).pool, pool_pre);
         assert_eq!(round(&deps, 3).rolled_over_from, Some(2));
     }
@@ -4080,8 +4379,24 @@ mod tests {
         let w = derive_winning_numbers(rnd.as_slice(), 6, 45);
         // Two tier-3 winners so the jackpot alloc splits (exercises remainder).
         let buyer2 = mk(&api, "buyer2");
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w, 3)), None).unwrap();
-        buy(&mut deps, &env, &buyer2, 1, Some(picks_matching(&w, 3)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&w, 3)),
+            None,
+        )
+        .unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer2,
+            1,
+            Some(picks_matching(&w, 3)),
+            None,
+        )
+        .unwrap();
         let pool_pre = round(&deps, 1).pool;
         run_draw_round(&mut deps, &mut env, &submitter, 1, rnd);
 
@@ -4117,20 +4432,52 @@ mod tests {
         // Round 1: EMPTY (no buys). Draw it — streak must stay 0.
         let rnd1 = HexBinary::from(vec![0x71; 32]);
         run_draw_round(&mut deps, &mut env, &submitter, 1, rnd1);
-        assert_eq!(round(&deps, 1).dry_streak, 0, "empty round advanced the streak");
+        assert_eq!(
+            round(&deps, 1).dry_streak,
+            0,
+            "empty round advanced the streak"
+        );
 
         // Round 2: SINGLE player, dry (match 4 winner). Still neutral -> streak 0.
         let rnd2 = HexBinary::from(vec![0x72; 32]);
         let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w2, 4)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&w2, 4)),
+            None,
+        )
+        .unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 2, rnd2);
-        assert_eq!(round(&deps, 2).dry_streak, 0, "single-player round advanced the streak");
+        assert_eq!(
+            round(&deps, 2).dry_streak,
+            0,
+            "single-player round advanced the streak"
+        );
 
         // Round 3: TWO players, dry -> now it counts -> streak 1.
         let rnd3 = HexBinary::from(vec![0x73; 32]);
         let w3 = derive_winning_numbers(rnd3.as_slice(), 6, 45);
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w3, 4)), None).unwrap();
-        buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w3, 0)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&w3, 4)),
+            None,
+        )
+        .unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &filler,
+            1,
+            Some(picks_matching(&w3, 0)),
+            None,
+        )
+        .unwrap();
         run_draw_round(&mut deps, &mut env, &submitter, 3, rnd3);
         assert_eq!(round(&deps, 3).dry_streak, 1);
 
@@ -4155,8 +4502,24 @@ mod tests {
             let round_id = (i + 1) as u64;
             let rnd = HexBinary::from(vec![byte; 32]);
             let w = derive_winning_numbers(rnd.as_slice(), 6, 45);
-            buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&w, 4)), None).unwrap();
-            buy(&mut deps, &env, &filler, 1, Some(picks_matching(&w, 0)), None).unwrap();
+            buy(
+                &mut deps,
+                &env,
+                &buyer,
+                1,
+                Some(picks_matching(&w, 4)),
+                None,
+            )
+            .unwrap();
+            buy(
+                &mut deps,
+                &env,
+                &filler,
+                1,
+                Some(picks_matching(&w, 0)),
+                None,
+            )
+            .unwrap();
             run_draw_round(&mut deps, &mut env, &submitter, round_id, rnd);
         }
 
@@ -4219,8 +4582,21 @@ mod tests {
         // Fixed picks; run draw. If it happens to match, adjust: pick numbers
         // guaranteed not to be all-winning is impossible to know a priori, so we
         // assert on the specific ticket's prize being zero via query first.
-        buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
-        run_draw(&mut deps, &env, &submitter, HexBinary::from(vec![0x33u8; 32]));
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(vec![1, 2, 3, 4, 5, 6]),
+            None,
+        )
+        .unwrap();
+        run_draw(
+            &mut deps,
+            &env,
+            &submitter,
+            HexBinary::from(vec![0x33u8; 32]),
+        );
 
         let prize: PrizeResponse = from_json(
             query(
@@ -4530,6 +4906,7 @@ mod tests {
                 reveal_timeout: None,
                 open_code_registration: None,
                 max_dry_rounds: None,
+                schedule_anchor: None,
             },
         )
         .unwrap();
@@ -4684,8 +5061,7 @@ mod tests {
         if let ExecuteMsg::SetConfig { split, .. } = &mut msg {
             *split = Some(FundSplitBps::new_unchecked(5000, 1000, 1500));
         }
-        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
-            .unwrap_err();
+        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg).unwrap_err();
         assert!(matches!(err, ContractError::InvalidConfig { .. }));
 
         // Valid mid-round update: draw_interval / rollover are always allowed
@@ -4746,6 +5122,8 @@ mod tests {
             reveal_timeout: None,
             open_code_registration: None,
             max_dry_rounds: None,
+            schedule_anchor: None,
+            clear_schedule_anchor: false,
             add_submitters: None,
             remove_submitters: None,
         }
@@ -4793,6 +5171,8 @@ mod tests {
             draw_interval: Some(300),
             max_dry_rounds: Some(5),
             reset_dry_streak: true,
+            schedule_anchor: None,
+            ..Default::default()
         };
         migrate(deps.as_mut(), env, msg).unwrap();
 
@@ -4991,8 +5371,7 @@ mod tests {
         assert!(matches!(err, ContractError::Shared(_)));
 
         // No funds at all.
-        let err = grant(&mut deps, &env, &submitter, &owner, 1, None, Some(vec![]))
-            .unwrap_err();
+        let err = grant(&mut deps, &env, &submitter, &owner, 1, None, Some(vec![])).unwrap_err();
         assert!(matches!(err, ContractError::Shared(_)));
 
         // Foreign denom.
@@ -5080,7 +5459,15 @@ mod tests {
 
         // A normal paid buy (non-winning quick-pick would be fine, but give it a
         // 3-match so the pool has multiple tiers) and a granted JACKPOT ticket.
-        buy(&mut deps, &env, &buyer, 1, Some(picks_matching(&winning, 3)), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(picks_matching(&winning, 3)),
+            None,
+        )
+        .unwrap();
         grant(
             &mut deps,
             &env,
@@ -5392,12 +5779,7 @@ mod tests {
         assert_eq!(pending_top_up(&deps, 2).amount, Uint128::new(seed));
 
         // Draw round 1 (no jackpot rollover needed — empty leftover ok).
-        run_draw(
-            &mut deps,
-            &env,
-            &submitter,
-            HexBinary::from([7u8; 32]),
-        );
+        run_draw(&mut deps, &env, &submitter, HexBinary::from([7u8; 32]));
 
         let r2 = round(&deps, 2);
         assert_eq!(r2.status, RoundStatus::Open);
@@ -5465,17 +5847,9 @@ mod tests {
         let seed = 100_000_000u128; // 100 SAF promotional seed
         top_up(&mut deps, &env, &admin, 1, seed).unwrap();
         assert_eq!(current(&deps).ticket_count, 2);
-        assert_eq!(
-            current(&deps).pool,
-            pool_from_buys + Uint128::new(seed)
-        );
+        assert_eq!(current(&deps).pool, pool_from_buys + Uint128::new(seed));
 
-        run_draw(
-            &mut deps,
-            &env,
-            &submitter,
-            HexBinary::from([9u8; 32]),
-        );
+        run_draw(&mut deps, &env, &submitter, HexBinary::from([9u8; 32]));
         // Round 1 settled; prize tiers were computed from the enlarged pool.
         let r1 = round(&deps, 1);
         assert_eq!(r1.status, RoundStatus::Settled);
@@ -5522,6 +5896,7 @@ mod tests {
                 reveal_timeout: Some(3600),
                 open_code_registration: None,
                 max_dry_rounds: None,
+                schedule_anchor: None,
             },
         )
         .unwrap();
@@ -5690,10 +6065,26 @@ mod tests {
         fn run(with_extra_ticket: bool) -> HexBinary {
             let (mut deps, api, env, _admin, submitter) = setup_commit_reveal();
             let buyer = mk(&api, "buyer");
-            buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
+            buy(
+                &mut deps,
+                &env,
+                &buyer,
+                1,
+                Some(vec![1, 2, 3, 4, 5, 6]),
+                None,
+            )
+            .unwrap();
             if with_extra_ticket {
                 let buyer2 = mk(&api, "buyer2");
-                buy(&mut deps, &env, &buyer2, 1, Some(vec![7, 8, 9, 10, 11, 12]), None).unwrap();
+                buy(
+                    &mut deps,
+                    &env,
+                    &buyer2,
+                    1,
+                    Some(vec![7, 8, 9, 10, 11, 12]),
+                    None,
+                )
+                .unwrap();
             }
 
             let mut env2 = env.clone();
@@ -5727,10 +6118,7 @@ mod tests {
                 deps.as_mut(),
                 env3,
                 message_info(&submitter, &[]),
-                ExecuteMsg::RevealRandomness {
-                    round_id: 1,
-                    value,
-                },
+                ExecuteMsg::RevealRandomness { round_id: 1, value },
             )
             .unwrap();
             round(&deps, 1).randomness.unwrap().randomness.unwrap()
@@ -5779,17 +6167,20 @@ mod tests {
                 reveal_timeout: None,
                 open_code_registration: None,
                 max_dry_rounds: None,
+                schedule_anchor: None,
             },
         )
         .unwrap();
 
         // Switch to Mock rejected.
         let mut msg = set_config_none();
-        if let ExecuteMsg::SetConfig { randomness_mode, .. } = &mut msg {
+        if let ExecuteMsg::SetConfig {
+            randomness_mode, ..
+        } = &mut msg
+        {
             *randomness_mode = Some(RandomnessMode::Mock);
         }
-        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
-            .unwrap_err();
+        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg).unwrap_err();
         assert!(matches!(err, ContractError::InvalidConfig { .. }));
 
         // Switch to Dev verify rejected.
@@ -5797,8 +6188,7 @@ mod tests {
         if let ExecuteMsg::SetConfig { verify_mode, .. } = &mut msg {
             *verify_mode = Some(VerifyMode::Dev);
         }
-        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg)
-            .unwrap_err();
+        let err = execute(deps.as_mut(), mock_env(), message_info(&admin, &[]), msg).unwrap_err();
         assert!(matches!(err, ContractError::InvalidConfig { .. }));
     }
 
@@ -5863,18 +6253,32 @@ mod tests {
                 reveal_timeout: None,
                 open_code_registration: None,
                 max_dry_rounds: None,
+                schedule_anchor: None,
             },
         )
         .unwrap();
         let buyer = mk(&api, "buyer");
-        buy(&mut deps, &env, &buyer, 1, Some(vec![1, 2, 3, 4, 5, 6]), None).unwrap();
+        buy(
+            &mut deps,
+            &env,
+            &buyer,
+            1,
+            Some(vec![1, 2, 3, 4, 5, 6]),
+            None,
+        )
+        .unwrap();
 
         let treasury_before: TreasuryBalanceResponse =
             from_json(query(deps.as_ref(), mock_env(), QueryMsg::TreasuryBalance {}).unwrap())
                 .unwrap();
         let pool_before = current(&deps).pool;
 
-        run_draw(&mut deps, &env, &submitter, HexBinary::from(vec![0x22u8; 32]));
+        run_draw(
+            &mut deps,
+            &env,
+            &submitter,
+            HexBinary::from(vec![0x22u8; 32]),
+        );
 
         let r1 = round(&deps, 1);
         let r2 = round(&deps, 2);
@@ -5887,5 +6291,881 @@ mod tests {
                 .unwrap();
         let swept = treasury_after.balance - treasury_before.balance;
         assert_eq!(r1.pool + swept, pool_before, "every usaf accounted");
+    }
+
+    // =======================================================================
+    // Multi-currency: a second instance settling in IBC USDC
+    // =======================================================================
+
+    /// The live Injective USDC denom on Safrochain (`transfer/channel-2`).
+    const USDC_DENOM: &str = "ibc/1E180C085A3A2688CDF2A781E5990BE8AA92CE69CB62A8CC6BB9F5EE17DD5C38";
+    /// 1 USDC = 1_000_000 base units (6 decimals, same as usaf).
+    const USDC_TICKET_PRICE: u128 = 1_000_000;
+
+    /// Instantiate a USDC-settled WinSaf instance (mock randomness, dev verify).
+    /// Mirrors `setup()` but pins `denom` / `ticket_price` to IBC USDC.
+    fn setup_usdc() -> (OD, MockApi, Env, Addr, Addr) {
+        let mut deps = mock_dependencies();
+        let api = deps.api;
+        let env = mock_env();
+        let admin = mk(&api, "admin");
+        let submitter = mk(&api, "relayer");
+
+        instantiate(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &[]),
+            InstantiateMsg {
+                admin: Some(admin.to_string()),
+                denom: Some(USDC_DENOM.to_string()),
+                ticket_price: Some(Coin::new(USDC_TICKET_PRICE, USDC_DENOM)),
+                draw_interval: Some(DRAW_INTERVAL),
+                numbers_per_ticket: None,
+                number_max: None,
+                split: None,
+                rollover_on_no_winner: Some(true),
+                randomness_mode: None,
+                verify_mode: None,
+                drand_pubkey: None,
+                drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
+                authorized_submitters: vec![submitter.to_string()],
+                min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
+                schedule_anchor: None,
+            },
+        )
+        .unwrap();
+        (deps, api, env, admin, submitter)
+    }
+
+    fn buy_usdc(
+        deps: &mut OD,
+        env: &Env,
+        buyer: &Addr,
+        count: u32,
+        referral_code: Option<String>,
+    ) -> Result<Response, ContractError> {
+        let funds = coins(USDC_TICKET_PRICE * count as u128, USDC_DENOM);
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(buyer, &funds),
+            ExecuteMsg::BuyTickets {
+                count,
+                numbers: None,
+                referral_code,
+            },
+        )
+    }
+
+    #[test]
+    fn usdc_instance_accepts_usdc_and_prices_in_usdc() {
+        let (mut deps, api, env, _admin, _sub) = setup_usdc();
+        let buyer = mk(&api, "buyer");
+
+        let cfg = cfg(&deps);
+        assert_eq!(cfg.denom, USDC_DENOM);
+        assert_eq!(cfg.ticket_price.denom, USDC_DENOM);
+        assert_eq!(cfg.ticket_price.amount, Uint128::new(USDC_TICKET_PRICE));
+        // Same economics as the SAF instance.
+        assert_eq!(cfg.split.prize_bps, 7_500);
+        assert_eq!(cfg.split.referral_bps, 1_000);
+        assert_eq!(cfg.split.treasury_bps, 1_500);
+
+        buy_usdc(&mut deps, &env, &buyer, 3, None).unwrap();
+        let r = current(&deps);
+        assert_eq!(r.ticket_count, 3);
+        // 3 USDC in: 75% prize, 15% treasury, referral folds into prize (unbound).
+        let total = USDC_TICKET_PRICE * 3;
+        assert_eq!(r.pool, Uint128::new(total * 8_500 / 10_000));
+        assert_eq!(treasury_bal(&deps), Uint128::new(total * 1_500 / 10_000));
+    }
+
+    #[test]
+    fn usdc_instance_rejects_usaf_payment() {
+        let (mut deps, api, env, _admin, _sub) = setup_usdc();
+        let buyer = mk(&api, "buyer");
+        let err = execute(
+            deps.as_mut(),
+            env,
+            message_info(&buyer, &coins(USDC_TICKET_PRICE, DENOM)),
+            ExecuteMsg::BuyTickets {
+                count: 1,
+                numbers: None,
+                referral_code: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Shared(_)));
+    }
+
+    #[test]
+    fn saf_instance_rejects_usdc_payment() {
+        let (mut deps, api, env, _admin, _sub) = setup();
+        let buyer = mk(&api, "buyer");
+        let err = execute(
+            deps.as_mut(),
+            env,
+            message_info(&buyer, &coins(TICKET_PRICE, USDC_DENOM)),
+            ExecuteMsg::BuyTickets {
+                count: 1,
+                numbers: None,
+                referral_code: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Shared(_)));
+    }
+
+    #[test]
+    fn usdc_instance_rejects_mixed_funds() {
+        let (mut deps, api, env, _admin, _sub) = setup_usdc();
+        let buyer = mk(&api, "buyer");
+        let funds = vec![
+            Coin::new(USDC_TICKET_PRICE, USDC_DENOM),
+            Coin::new(1u128, DENOM),
+        ];
+        let err = execute(
+            deps.as_mut(),
+            env,
+            message_info(&buyer, &funds),
+            ExecuteMsg::BuyTickets {
+                count: 1,
+                numbers: None,
+                referral_code: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Shared(_)));
+    }
+
+    #[test]
+    fn usdc_prize_claim_pays_usdc() {
+        let (mut deps, api, env, _admin, submitter) = setup_usdc();
+        let buyer = mk(&api, "buyer");
+
+        // Buy enough tickets that at least one wins a tier.
+        buy_usdc(&mut deps, &env, &buyer, 50, None).unwrap();
+        run_draw(
+            &mut deps,
+            &env,
+            &submitter,
+            HexBinary::from(vec![0x31u8; 32]),
+        );
+
+        let prize: PrizeResponse = from_json(
+            query(
+                deps.as_ref(),
+                mock_env(),
+                QueryMsg::Prize {
+                    round_id: 1,
+                    owner: buyer.to_string(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!prize.claimable.is_zero(), "expected a winning tier");
+
+        let ticket_id = prize.winning_ticket_ids[0].clone();
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&buyer, &[]),
+            ExecuteMsg::ClaimReward {
+                round_id: 1,
+                ticket_id,
+            },
+        )
+        .unwrap();
+
+        let sent = res
+            .messages
+            .iter()
+            .find_map(|m| match &m.msg {
+                CosmosMsg::Bank(BankMsg::Send { amount, .. }) => Some(amount.clone()),
+                _ => None,
+            })
+            .expect("bank send");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].denom, USDC_DENOM, "prize must pay in USDC");
+    }
+
+    #[test]
+    fn usdc_referral_and_treasury_payouts_use_usdc() {
+        let (mut deps, api, env, admin, _sub) = setup_usdc();
+        let referrer = mk(&api, "referrer");
+        let buyer = mk(&api, "buyer");
+
+        // Bind, then buy so the referral cut accrues in USDC.
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&buyer, &[]),
+            ExecuteMsg::BindReferrer {
+                referrer: Some(referrer.to_string()),
+                code: None,
+            },
+        )
+        .unwrap();
+        buy_usdc(&mut deps, &env, &buyer, 10, None).unwrap();
+
+        let summary: ReferralSummaryResponse = from_json(
+            query(
+                deps.as_ref(),
+                mock_env(),
+                QueryMsg::ReferralSummary {
+                    addr: referrer.to_string(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary.denom, USDC_DENOM);
+        assert_eq!(
+            summary.pending,
+            Uint128::new(USDC_TICKET_PRICE * 10 * 1_000 / 10_000)
+        );
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&referrer, &[]),
+            ExecuteMsg::ClaimReferral {},
+        )
+        .unwrap();
+        let sent = res
+            .messages
+            .iter()
+            .find_map(|m| match &m.msg {
+                CosmosMsg::Bank(BankMsg::Send { amount, .. }) => Some(amount.clone()),
+                _ => None,
+            })
+            .expect("bank send");
+        assert_eq!(sent[0].denom, USDC_DENOM, "referral must pay in USDC");
+
+        // Treasury withdrawal also settles in USDC.
+        let available = treasury_bal(&deps);
+        assert!(!available.is_zero());
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&admin, &[]),
+            ExecuteMsg::WithdrawTreasury {
+                to: admin.to_string(),
+                amount: available,
+            },
+        )
+        .unwrap();
+        let sent = res
+            .messages
+            .iter()
+            .find_map(|m| match &m.msg {
+                CosmosMsg::Bank(BankMsg::Send { amount, .. }) => Some(amount.clone()),
+                _ => None,
+            })
+            .expect("bank send");
+        assert_eq!(sent[0].denom, USDC_DENOM, "treasury must pay in USDC");
+    }
+
+    #[test]
+    fn usdc_top_up_and_cancel_pending_use_usdc() {
+        let (mut deps, _api, env, admin, _sub) = setup_usdc();
+
+        // Immediate top-up of the open round in USDC.
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &coins(5_000_000, USDC_DENOM)),
+            ExecuteMsg::TopUpPool { round_id: 1 },
+        )
+        .unwrap();
+        assert_eq!(current(&deps).pool, Uint128::new(5_000_000));
+
+        // usaf top-up must be rejected on a USDC instance.
+        let err = execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &coins(5_000_000, DENOM)),
+            ExecuteMsg::TopUpPool { round_id: 1 },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::Shared(_)));
+
+        // Escrow a future round, then refund it in USDC.
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &coins(2_000_000, USDC_DENOM)),
+            ExecuteMsg::TopUpPool { round_id: 5 },
+        )
+        .unwrap();
+        let res = execute(
+            deps.as_mut(),
+            env,
+            message_info(&admin, &[]),
+            ExecuteMsg::CancelPendingTopUp { round_id: 5 },
+        )
+        .unwrap();
+        let sent = res
+            .messages
+            .iter()
+            .find_map(|m| match &m.msg {
+                CosmosMsg::Bank(BankMsg::Send { amount, .. }) => Some(amount.clone()),
+                _ => None,
+            })
+            .expect("bank send");
+        assert_eq!(sent[0].denom, USDC_DENOM);
+        assert_eq!(sent[0].amount, Uint128::new(2_000_000));
+    }
+
+    #[test]
+    fn usdc_instance_rejects_ticket_price_denom_mismatch() {
+        let mut deps = mock_dependencies();
+        let api = deps.api;
+        let admin = mk(&api, "admin");
+        let err = instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&admin, &[]),
+            InstantiateMsg {
+                admin: None,
+                denom: Some(USDC_DENOM.to_string()),
+                // usaf price on a USDC instance must be refused.
+                ticket_price: Some(Coin::new(5_000_000u128, DENOM)),
+                draw_interval: None,
+                numbers_per_ticket: None,
+                number_max: None,
+                split: None,
+                rollover_on_no_winner: None,
+                randomness_mode: None,
+                verify_mode: None,
+                drand_pubkey: None,
+                drand_chain_hash: None,
+                drand_genesis_time: None,
+                drand_period: None,
+                authorized_submitters: vec![],
+                min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
+                schedule_anchor: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidConfig { .. }));
+    }
+
+    // =======================================================================
+    // Fixed draw schedule (schedule_anchor)
+    // =======================================================================
+
+    fn anchored_cfg(anchor: Option<u64>, interval: u64) -> Config {
+        let api = MockApi::default();
+        Config {
+            admin: api.addr_make("admin"),
+            denom: DENOM.to_string(),
+            ticket_price: Coin::new(TICKET_PRICE, DENOM),
+            draw_interval: interval,
+            numbers_per_ticket: 6,
+            number_max: 45,
+            split: FundSplitBps::default(),
+            rollover_on_no_winner: true,
+            paused: false,
+            randomness_mode: RandomnessMode::Mock,
+            verify_mode: VerifyMode::Dev,
+            drand_pubkey: HexBinary::default(),
+            drand_chain_hash: String::new(),
+            drand_genesis_time: 0,
+            drand_period: 0,
+            authorized_submitters: vec![],
+            min_claim_usaf: Uint128::zero(),
+            reveal_timeout: 3600,
+            open_code_registration: false,
+            max_dry_rounds: 0,
+            schedule_anchor: anchor,
+        }
+    }
+
+    #[test]
+    fn schedule_without_anchor_floats() {
+        let c = anchored_cfg(None, 3600);
+        assert_eq!(next_close_at(&c, 1_000).unwrap(), 4_600);
+        assert_eq!(next_close_at(&c, 1_500).unwrap(), 5_100);
+    }
+
+    #[test]
+    fn schedule_with_anchor_snaps_to_grid() {
+        // Grid: 1000, 4600, 8200, ... (anchor 1000, interval 3600)
+        let c = anchored_cfg(Some(1_000), 3600);
+        // Opening a hair after the grid point still closes on the next one.
+        assert_eq!(next_close_at(&c, 1_005).unwrap(), 4_600);
+        assert_eq!(next_close_at(&c, 2_000).unwrap(), 4_600);
+        // Exactly on a grid point moves to the following one.
+        assert_eq!(next_close_at(&c, 4_600).unwrap(), 8_200);
+    }
+
+    #[test]
+    fn schedule_anchor_keeps_a_usable_sales_window() {
+        // Opening at 4_500 leaves only 100s to the 4_600 grid point (< interval/4),
+        // so the round must close at the following grid point instead.
+        let c = anchored_cfg(Some(1_000), 3600);
+        assert_eq!(next_close_at(&c, 4_500).unwrap(), 8_200);
+    }
+
+    #[test]
+    fn schedule_anchor_in_the_future_waits_for_the_grid() {
+        let c = anchored_cfg(Some(10_000), 3600);
+        assert_eq!(next_close_at(&c, 1_000).unwrap(), 10_000);
+    }
+
+    #[test]
+    fn schedule_anchor_does_not_drift_across_rounds() {
+        // Two instances sharing an anchor stay aligned even when each Draw lands
+        // late: every round closes on the same grid regardless of open time.
+        let c = anchored_cfg(Some(0), 86_400);
+        // Round opens 5 min late after the previous close.
+        assert_eq!(next_close_at(&c, 86_400 + 300).unwrap(), 172_800);
+        // Next one opens 20 min late; still the same grid.
+        assert_eq!(next_close_at(&c, 172_800 + 1_200).unwrap(), 259_200);
+    }
+
+    #[test]
+    fn set_config_sets_and_clears_schedule_anchor() {
+        let (mut deps, _api, env, admin, _sub) = setup();
+
+        let set =
+            |deps: &mut OD, anchor: Option<u64>, clear: bool| -> Result<Response, ContractError> {
+                execute(
+                    deps.as_mut(),
+                    env.clone(),
+                    message_info(&admin, &[]),
+                    ExecuteMsg::SetConfig {
+                        admin: None,
+                        ticket_price: None,
+                        draw_interval: None,
+                        split: None,
+                        rollover_on_no_winner: None,
+                        randomness_mode: None,
+                        verify_mode: None,
+                        drand_pubkey: None,
+                        drand_chain_hash: None,
+                        drand_genesis_time: None,
+                        drand_period: None,
+                        min_claim_usaf: None,
+                        reveal_timeout: None,
+                        open_code_registration: None,
+                        max_dry_rounds: None,
+                        schedule_anchor: anchor,
+                        clear_schedule_anchor: clear,
+                        add_submitters: None,
+                        remove_submitters: None,
+                    },
+                )
+            };
+
+        // Anchor edits are allowed mid-round (they only affect future rounds).
+        set(&mut deps, Some(1_700_000_000), false).unwrap();
+        assert_eq!(cfg(&deps).schedule_anchor, Some(1_700_000_000));
+
+        set(&mut deps, None, true).unwrap();
+        assert_eq!(cfg(&deps).schedule_anchor, None);
+    }
+
+    #[test]
+    fn migrate_can_adopt_schedule_anchor() {
+        let (mut deps, _api, _env, _admin, _sub) = setup();
+        assert_eq!(cfg(&deps).schedule_anchor, None);
+
+        // Simulate the pre-upgrade code version so migrate() accepts the call.
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, "0.0.1").unwrap();
+        migrate(
+            deps.as_mut(),
+            mock_env(),
+            MigrateMsg {
+                schedule_anchor: Some(1_700_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let after = cfg(&deps);
+        assert_eq!(after.schedule_anchor, Some(1_700_000_000));
+        // Everything else is untouched by the migration.
+        assert_eq!(after.denom, DENOM);
+        assert_eq!(after.ticket_price.amount, Uint128::new(TICKET_PRICE));
+        assert_eq!(after.split.prize_bps, 7_500);
+    }
+
+    #[test]
+    fn migrate_preserves_live_state_and_balances() {
+        // A code-only migration must not disturb the open round, its pool, the
+        // treasury, or outstanding referral credit.
+        let (mut deps, api, env, _admin, _sub) = setup();
+        let referrer = mk(&api, "referrer");
+        let buyer = mk(&api, "buyer");
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&buyer, &[]),
+            ExecuteMsg::BindReferrer {
+                referrer: Some(referrer.to_string()),
+                code: None,
+            },
+        )
+        .unwrap();
+        buy(&mut deps, &env, &buyer, 4, None, None).unwrap();
+
+        let round_before = current(&deps);
+        let treasury_before = treasury_bal(&deps);
+        let pending_before = REFERRAL_EARNINGS
+            .load(&deps.storage, &referrer)
+            .unwrap_or_default();
+        let current_id_before = CURRENT_ROUND.load(&deps.storage).unwrap();
+
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, "0.0.1").unwrap();
+        migrate(deps.as_mut(), mock_env(), MigrateMsg::default()).unwrap();
+
+        let round_after = current(&deps);
+        assert_eq!(round_after.id, round_before.id);
+        assert_eq!(round_after.pool, round_before.pool);
+        assert_eq!(round_after.ticket_count, round_before.ticket_count);
+        assert_eq!(round_after.closes_at, round_before.closes_at);
+        assert_eq!(treasury_bal(&deps), treasury_before);
+        assert_eq!(
+            REFERRAL_EARNINGS
+                .load(&deps.storage, &referrer)
+                .unwrap_or_default(),
+            pending_before
+        );
+        assert_eq!(
+            CURRENT_ROUND.load(&deps.storage).unwrap(),
+            current_id_before
+        );
+        // A bare migrate leaves the schedule floating.
+        assert_eq!(cfg(&deps).schedule_anchor, None);
+    }
+
+    // --- drand quicknet (real beacons) / fair cancel / one commitment ------
+
+    /// drand quicknet group public key (G2), chain hash and two published
+    /// beacons, cross-checked on api.drand.sh and drand.cloudflare.com.
+    const QUICKNET_PUBKEY: &str = "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a";
+    const QUICKNET_HASH: &str = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971";
+    const BEACON_1M_SIG: &str = "83ad29e4c409f9470fc2ef02f90214df49e02b441a1a241a82d622d9f608ef98fd8b11a029f1bee9d9e83b45088abe72";
+    const BEACON_1M_RND: &str = "b22aad4794f7451896f7a371aa46106fd84d919f3f569acd5b2fddf1d1440af3";
+    const BEACON_32M_SIG: &str = "b1c90cc3c290ae966b9b5230cd3c93389bd95ae0274f7dce8ef43979745fa747c72fbebe7ddafb79088120565d91b91f";
+    const BEACON_32M_RND: &str = "ea1bdeb86e62a543551740bf792d78a296861de06a8bbd64b2b0e2134f40b166";
+
+    fn hex(s: &str) -> HexBinary {
+        HexBinary::from_hex(s).unwrap()
+    }
+
+    #[test]
+    fn bls_verifies_real_quicknet_beacons() {
+        let api = MockApi::default();
+        let pk = hex(QUICKNET_PUBKEY);
+        for (round_no, sig, rnd) in [
+            (1_000_000u64, BEACON_1M_SIG, BEACON_1M_RND),
+            (32_000_000u64, BEACON_32M_SIG, BEACON_32M_RND),
+        ] {
+            verify_drand(&api, &VerifyMode::Bls, pk.as_slice(), round_no, &hex(rnd), hex(sig).as_slice())
+                .unwrap_or_else(|e| panic!("round {round_no} must verify: {e}"));
+        }
+        // A real signature presented for another round must fail the pairing.
+        let err = verify_drand(
+            &api,
+            &VerifyMode::Bls,
+            pk.as_slice(),
+            1_000_001,
+            &hex(BEACON_1M_RND),
+            hex(BEACON_1M_SIG).as_slice(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::VerificationFailed { .. }));
+    }
+
+    /// Instantiate in drand + BLS mode on quicknet, with the round closing so it
+    /// binds to beacon 32,000,000 (published at genesis + 31,999,999 * 3).
+    fn setup_drand() -> (OD, MockApi, Env, Addr, Addr) {
+        let mut deps = mock_dependencies();
+        let api = deps.api;
+        let mut env = mock_env();
+        // close = 1_788_803_361 => first beacon after close = 32,000,000.
+        env.block.time = Timestamp::from_seconds(1_788_803_361 - DRAW_INTERVAL);
+        let admin = mk(&api, "admin");
+        let keeper = mk(&api, "keeper-submitter");
+        instantiate(
+            deps.as_mut(),
+            env.clone(),
+            message_info(&admin, &[]),
+            InstantiateMsg {
+                admin: Some(admin.to_string()),
+                denom: None,
+                ticket_price: None,
+                draw_interval: Some(DRAW_INTERVAL),
+                numbers_per_ticket: None,
+                number_max: None,
+                split: None,
+                rollover_on_no_winner: Some(true),
+                randomness_mode: Some(RandomnessMode::Drand),
+                verify_mode: Some(VerifyMode::Bls),
+                drand_pubkey: Some(hex(QUICKNET_PUBKEY)),
+                drand_chain_hash: Some(QUICKNET_HASH.to_string()),
+                drand_genesis_time: Some(DRAND_QUICKNET_GENESIS),
+                drand_period: Some(DRAND_QUICKNET_PERIOD),
+                authorized_submitters: vec![keeper.to_string()],
+                min_claim_usaf: None,
+                reveal_timeout: None,
+                open_code_registration: None,
+                max_dry_rounds: None,
+                schedule_anchor: None,
+            },
+        )
+        .unwrap();
+        (deps, api, env, admin, keeper)
+    }
+
+    #[test]
+    fn drand_round_binds_future_beacon_and_anyone_can_relay_it() {
+        let (mut deps, api, env, _admin, _keeper) = setup_drand();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 3, None, None).unwrap();
+
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL);
+        execute(deps.as_mut(), env2.clone(), message_info(&buyer, &[]), ExecuteMsg::CloseRound {})
+            .unwrap();
+        let req = RANDOMNESS.load(&deps.storage, 1).unwrap();
+        assert_eq!(req.beacon_round, 32_000_000);
+
+        // A beacon for another round is rejected by the pairing check.
+        let stranger = mk(&api, "anyone");
+        let err = execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&stranger, &[]),
+            ExecuteMsg::SubmitRandomness {
+                round_id: 1,
+                randomness: hex(BEACON_1M_RND),
+                signature: Some(hex(BEACON_1M_SIG)),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::VerificationFailed { .. }));
+
+        // The real bound beacon is accepted from ANY address (not a submitter).
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&stranger, &[]),
+            ExecuteMsg::SubmitRandomness {
+                round_id: 1,
+                randomness: hex(BEACON_32M_RND),
+                signature: Some(hex(BEACON_32M_SIG)),
+            },
+        )
+        .unwrap();
+        execute(deps.as_mut(), env2.clone(), message_info(&stranger, &[]), ExecuteMsg::Draw { round_id: 1 })
+            .unwrap();
+        let settled = round(&deps, 1);
+        assert_eq!(settled.status, RoundStatus::Settled);
+        assert_eq!(
+            settled.winning_numbers.unwrap(),
+            derive_winning_numbers(hex(BEACON_32M_RND).as_slice(), 6, 45)
+        );
+    }
+
+    #[test]
+    fn drand_mode_admin_cannot_cancel_before_grace() {
+        let (mut deps, api, env, admin, _keeper) = setup_drand();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL);
+        execute(deps.as_mut(), env2.clone(), message_info(&buyer, &[]), ExecuteMsg::CloseRound {})
+            .unwrap();
+
+        // The beacon is public seconds after close: no early cancel, admin included.
+        let err = execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&admin, &[]),
+            ExecuteMsg::CancelRound { round_id: 1 },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::CannotCancel { .. }));
+
+        // After the grace period anyone may recover the round.
+        let mut env3 = env2.clone();
+        advance(&mut env3, CANCEL_GRACE_SECONDS);
+        execute(
+            deps.as_mut(),
+            env3,
+            message_info(&mk(&api, "anyone"), &[]),
+            ExecuteMsg::CancelRound { round_id: 1 },
+        )
+        .unwrap();
+        assert_eq!(round(&deps, 1).status, RoundStatus::Cancelled);
+    }
+
+    #[test]
+    fn commit_reveal_rejects_a_second_commitment() {
+        let (mut deps, api, env, _admin, submitter) = setup_commit_reveal();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(deps.as_mut(), env2.clone(), message_info(&buyer, &[]), ExecuteMsg::CloseRound {})
+            .unwrap();
+        let commit = |seed: u8| ExecuteMsg::CommitRandomness {
+            round_id: 1,
+            commitment: HexBinary::from(sha256(&[seed; 32])),
+        };
+        execute(deps.as_mut(), env2.clone(), message_info(&submitter, &[]), commit(1)).unwrap();
+        let deadline = RANDOMNESS.load(&deps.storage, 1).unwrap().reveal_deadline;
+
+        let mut env3 = env2.clone();
+        advance(&mut env3, 600);
+        let err = execute(deps.as_mut(), env3, message_info(&submitter, &[]), commit(2)).unwrap_err();
+        assert!(matches!(err, ContractError::AlreadyCommitted { round_id: 1 }));
+        // The original commitment and its deadline are untouched.
+        let req = RANDOMNESS.load(&deps.storage, 1).unwrap();
+        assert_eq!(req.commitment, Some(HexBinary::from(sha256(&[1u8; 32]))));
+        assert_eq!(req.reveal_deadline, deadline);
+    }
+
+    #[test]
+    fn cancel_refunds_only_the_rounds_own_ticket_money() {
+        // Round 1 settles with no winner, so its pool rolls into round 2. Round 2
+        // is then cancelled: its buyers get back what THEY paid in, and the
+        // rolled-over jackpot moves on to round 3 instead of being shared out.
+        let (mut deps, api, env, admin, _sub) = setup_commit_reveal();
+        let p1 = mk(&api, "p1");
+        let p2 = mk(&api, "p2");
+        let picks = |v: [u8; 6]| Some(v.to_vec());
+
+        // Round 1: run it through commit-reveal with picks that cannot win.
+        buy(&mut deps, &env, &p1, 2, picks([1, 2, 3, 4, 5, 6]), None).unwrap();
+        let r1_pool = round(&deps, 1).pool;
+        // Force a no-winner settle: simulate the draw outcome directly.
+        let mut r1 = ROUNDS.load(&deps.storage, 1).unwrap();
+        r1.status = RoundStatus::Settled;
+        r1.pool = Uint128::zero();
+        ROUNDS.save(deps.as_mut().storage, 1, &r1).unwrap();
+        let cfg_now = CONFIG.load(&deps.storage).unwrap();
+        let next = open_next_round(deps.as_mut().storage, 1, &cfg_now, env.block.time.seconds(), r1_pool)
+            .unwrap();
+        assert_eq!(next, 2);
+        let r2_open = round(&deps, 2);
+        assert_eq!(r2_open.rollover_in, r1_pool);
+        assert_eq!(r2_open.rolled_over_from, Some(1));
+
+        // Round 2: three tickets bought, then the round gets stuck and is cancelled.
+        buy(&mut deps, &env, &p2, 3, None, None).unwrap();
+        let r2 = ROUNDS.load(&deps.storage, 2).unwrap();
+        let contributions = r2.ticket_contributions();
+        assert_eq!(r2.pool, r1_pool + contributions);
+
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(deps.as_mut(), env2.clone(), message_info(&p2, &[]), ExecuteMsg::CloseRound {})
+            .unwrap();
+        execute(
+            deps.as_mut(),
+            env2.clone(),
+            message_info(&admin, &[]),
+            ExecuteMsg::CancelRound { round_id: 2 },
+        )
+        .unwrap();
+
+        let per_ticket = contributions / Uint128::from(3u128);
+        let refunded = per_ticket * Uint128::from(3u128);
+        for seq in 0..3u64 {
+            let t = TICKETS.load(&deps.storage, (2, ticket_id(seq).as_str())).unwrap();
+            assert_eq!(t.prize, per_ticket);
+        }
+        assert_eq!(round(&deps, 2).pool, refunded);
+        // The jackpot carried in (plus rounding dust) opens round 3.
+        let r3 = current(&deps);
+        assert_eq!(r3.id, 3);
+        assert_eq!(r3.pool, r1_pool + (contributions - refunded));
+        assert_eq!(r3.rollover_in, r3.pool);
+        assert_eq!(r3.rolled_over_from, Some(2));
+    }
+
+    #[test]
+    fn migrate_switches_commit_reveal_to_drand_and_backfills_rollover() {
+        let (mut deps, api, env, _admin, _sub) = setup_commit_reveal();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 2, None, None).unwrap();
+        let pool = round(&deps, 1).pool;
+
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, "0.0.1").unwrap();
+        // A backfill larger than the pool is refused.
+        let too_big = MigrateMsg {
+            current_round_rollover_in: Some(pool + Uint128::one()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            migrate(deps.as_mut(), mock_env(), too_big),
+            Err(ContractError::MigrationBlocked { .. })
+        ));
+
+        migrate(
+            deps.as_mut(),
+            mock_env(),
+            MigrateMsg {
+                randomness_mode: Some(RandomnessMode::Drand),
+                verify_mode: Some(VerifyMode::Bls),
+                drand_pubkey: Some(hex(QUICKNET_PUBKEY)),
+                drand_chain_hash: Some(QUICKNET_HASH.to_string()),
+                current_round_rollover_in: Some(Uint128::new(1_000_000)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = cfg(&deps);
+        assert!(matches!(c.randomness_mode, RandomnessMode::Drand));
+        assert!(matches!(c.verify_mode, VerifyMode::Bls));
+        assert_eq!(c.drand_chain_hash, QUICKNET_HASH);
+        // Genesis/period default to quicknet when the old config had none.
+        assert_eq!(c.drand_genesis_time, DRAND_QUICKNET_GENESIS);
+        assert_eq!(c.drand_period, DRAND_QUICKNET_PERIOD);
+        assert_eq!(round(&deps, 1).rollover_in, Uint128::new(1_000_000));
+        // Everything that holds money is untouched.
+        assert_eq!(round(&deps, 1).pool, pool);
+        assert_eq!(round(&deps, 1).ticket_count, 2);
+    }
+
+    #[test]
+    fn migrate_refuses_randomness_switch_with_a_draw_in_flight() {
+        let (mut deps, api, env, _admin, _sub) = setup_commit_reveal();
+        let buyer = mk(&api, "buyer");
+        buy(&mut deps, &env, &buyer, 1, None, None).unwrap();
+        let mut env2 = env.clone();
+        advance(&mut env2, DRAW_INTERVAL + 1);
+        execute(deps.as_mut(), env2, message_info(&buyer, &[]), ExecuteMsg::CloseRound {})
+            .unwrap();
+
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, "0.0.1").unwrap();
+        let err = migrate(
+            deps.as_mut(),
+            mock_env(),
+            MigrateMsg {
+                randomness_mode: Some(RandomnessMode::Drand),
+                verify_mode: Some(VerifyMode::Bls),
+                drand_pubkey: Some(hex(QUICKNET_PUBKEY)),
+                drand_chain_hash: Some(QUICKNET_HASH.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::MigrationBlocked { .. }));
+        assert!(matches!(cfg(&deps).randomness_mode, RandomnessMode::CommitReveal));
     }
 }

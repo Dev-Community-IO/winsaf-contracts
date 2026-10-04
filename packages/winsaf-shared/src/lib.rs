@@ -11,7 +11,7 @@
 //! ## Modules
 //! - [`constants`] — protocol invariants (denom, decimals, bps, economics defaults).
 //! - [`error`]     — [`SharedError`] variants reused by contract error enums.
-//! - [`money`]     — `usaf` payment validation helpers.
+//! - [`money`]     — settlement-denom payment validation helpers.
 //! - [`split`]     — [`FundSplitBps`] revenue split (prize / referral / treasury).
 //! - [`status`]    — [`RoundStatus`] lottery-round state machine.
 //! - [`beacon`]    — [`BeaconRef`] external drand/nois randomness references.
@@ -42,6 +42,9 @@ pub use constants::{
     USAF_PER_SAF,
 };
 pub use error::SharedError;
-pub use money::{assert_exact_usaf, assert_min_usaf, must_pay_usaf_only, saf_to_usaf, usaf};
+pub use money::{
+    assert_exact_denom, assert_exact_usaf, assert_min_usaf, must_pay_denom_only,
+    must_pay_usaf_only, saf_to_usaf, usaf,
+};
 pub use split::{FundSplitBps, SplitAmounts};
 pub use status::RoundStatus;

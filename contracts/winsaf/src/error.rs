@@ -73,16 +73,16 @@ pub enum ContractError {
     InvalidTicketCount { count: u32, max: u32 },
 
     /// Round would exceed the hard per-round ticket cap (draw/cancel gas bound).
-    #[error(
-        "round ticket cap exceeded: current {current}, requested {requested}, max {max}"
-    )]
+    #[error("round ticket cap exceeded: current {current}, requested {requested}, max {max}")]
     RoundTicketCap {
         current: u64,
         requested: u32,
         max: u64,
     },
 
-    #[error("ticket must have exactly {expected} distinct numbers in 1..={number_max} (got {reason})")]
+    #[error(
+        "ticket must have exactly {expected} distinct numbers in 1..={number_max} (got {reason})"
+    )]
     InvalidNumbers {
         expected: u8,
         number_max: u8,
@@ -106,7 +106,7 @@ pub enum ContractError {
 
     // --- Treasury ----------------------------------------------------------
     /// A `WithdrawTreasury` requested more than the tracked treasury balance.
-    #[error("insufficient treasury balance: requested {requested} usaf, available {available} usaf")]
+    #[error("insufficient treasury balance: requested {requested}, available {available}")]
     InsufficientTreasury {
         requested: String,
         available: String,
@@ -129,7 +129,7 @@ pub enum ContractError {
     #[error("unknown referral code: {code}")]
     UnknownReferralCode { code: String },
 
-    /// A referrer has nothing to claim (or below the `min_claim_usaf` floor).
+    /// A referrer has nothing to claim (or below the `min_claim` floor).
     #[error("nothing to claim")]
     NothingToClaim,
 
@@ -162,6 +162,12 @@ pub enum ContractError {
     #[error("no commitment stored for round {round_id}")]
     NoCommitment { round_id: u64 },
 
+    /// Commit-reveal: a commitment is already stored for this round. It cannot be
+    /// replaced (re-committing would let the submitter retry until it liked the
+    /// outcome and push the reveal deadline back).
+    #[error("randomness for round {round_id} is already committed")]
+    AlreadyCommitted { round_id: u64 },
+
     /// Commit-reveal: the reveal was sent by an address other than the one that
     /// posted the commitment. Only the committer may reveal.
     #[error("only the committer may reveal randomness for round {round_id}")]
@@ -188,6 +194,11 @@ pub enum ContractError {
     /// Migration was invoked with an incompatible on-chain contract name.
     #[error("cannot migrate from contract '{found}' to '{expected}'")]
     InvalidMigration { expected: String, found: String },
+
+    /// A migration step is unsafe in the current state (e.g. switching the
+    /// randomness mechanism while a draw is in flight).
+    #[error("migration blocked: {reason}")]
+    MigrationBlocked { reason: String },
 }
 
 impl ContractError {

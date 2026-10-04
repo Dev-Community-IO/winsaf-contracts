@@ -65,6 +65,11 @@ pub struct InstantiateMsg {
     /// disables forced rolldown. Non-zero forces jackpot down after that many
     /// dry rounds.
     pub max_dry_rounds: Option<u64>,
+    /// Optional draw-schedule anchor (unix seconds). When set, rounds close on
+    /// the fixed grid `anchor + k * draw_interval` so the schedule never drifts.
+    /// Two instances sharing an anchor and interval draw at the same time.
+    /// `None` → legacy floating schedule (`opens_at + draw_interval`).
+    pub schedule_anchor: Option<u64>,
 }
 
 // ===========================================================================
@@ -216,6 +221,13 @@ pub enum ExecuteMsg {
         /// Optional "Must Be Won" cap. `0` = unlimited rollover (default).
         /// Non-zero forces jackpot down after that many dry rounds.
         max_dry_rounds: Option<u64>,
+        /// Set the fixed draw-schedule anchor (unix seconds). Takes effect for
+        /// rounds opened AFTER this call; the open round keeps its `closes_at`.
+        schedule_anchor: Option<u64>,
+        /// Clear the anchor and return to the floating schedule. Ignored when
+        /// `schedule_anchor` is also set in the same call.
+        #[serde(default)]
+        clear_schedule_anchor: bool,
         /// Submitters to ADD to the authorized set.
         add_submitters: Option<Vec<String>>,
         /// Submitters to REMOVE from the authorized set.
@@ -300,6 +312,34 @@ pub struct MigrateMsg {
     /// accumulated before the empty/single-player-neutral fix).
     #[serde(default)]
     pub reset_dry_streak: bool,
+    /// Set the fixed draw-schedule anchor (unix seconds) during migration, so a
+    /// live contract can adopt a drift-free schedule without a separate call.
+    /// Only affects rounds opened after the migration.
+    pub schedule_anchor: Option<u64>,
+    /// Switch the randomness mechanism (e.g. `commit_reveal` -> `drand`).
+    /// `SetConfig` can never change it on a live contract (a round is always
+    /// open), so this is the upgrade path. Allowed only while the current round
+    /// is `open` with no randomness requested, so no draw is in flight; the next
+    /// close binds the new mechanism. Validated like instantiate.
+    #[serde(default)]
+    pub randomness_mode: Option<RandomnessMode>,
+    #[serde(default)]
+    pub verify_mode: Option<VerifyMode>,
+    /// drand group public key (quicknet: 96-byte G2, hex).
+    #[serde(default)]
+    pub drand_pubkey: Option<HexBinary>,
+    #[serde(default)]
+    pub drand_chain_hash: Option<String>,
+    #[serde(default)]
+    pub drand_genesis_time: Option<u64>,
+    #[serde(default)]
+    pub drand_period: Option<u64>,
+    /// Backfill `Round.rollover_in` of the CURRENT round, which opened before the
+    /// field existed: the exact amount it was seeded with from the previous round
+    /// (the previous draw's `rollover` event attribute). Must not exceed
+    /// `pool - top_up_total`. Rounds opened after this upgrade track it on-chain.
+    #[serde(default)]
+    pub current_round_rollover_in: Option<Uint128>,
 }
 
 // ===========================================================================
@@ -337,6 +377,10 @@ pub struct RoundResponse {
     /// Cumulative promotional top-up usaf for this round (included in `pool`).
     #[serde(default)]
     pub top_up_total: Uint128,
+    /// Prize money carried into this round from earlier rounds (included in
+    /// `pool`, excludes top-ups). The UI can show "includes X rolled over".
+    #[serde(default)]
+    pub rollover_in: Uint128,
 }
 
 /// A ticket paired with its stable id (round-local sequence).

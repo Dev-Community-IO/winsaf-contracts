@@ -72,7 +72,7 @@
       "minimum": 0.0
     },
     "max_dry_rounds": {
-      "description": "\"Must Be Won\" cap: max consecutive dry rounds before a forced jackpot rolldown to the best present lower tier. `None` → 5. `0` disables it.",
+      "description": "Optional \"Must Be Won\" cap. `None` → 0 (unlimited rollover). `0` disables forced rolldown. Non-zero forces jackpot down after that many dry rounds.",
       "type": [
         "integer",
         "null"
@@ -142,6 +142,15 @@
         "boolean",
         "null"
       ]
+    },
+    "schedule_anchor": {
+      "description": "Optional draw-schedule anchor (unix seconds). When set, rounds close on the fixed grid `anchor + k * draw_interval` so the schedule never drifts. Two instances sharing an anchor and interval draw at the same time. `None` → legacy floating schedule (`opens_at + draw_interval`).",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
     },
     "split": {
       "description": "Revenue split. `None` → 7500/1000/1500 (must sum to 10000).",

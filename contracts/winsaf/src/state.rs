@@ -178,6 +178,19 @@ pub struct Config {
     /// across a code migration.
     #[serde(default = "default_max_dry_rounds")]
     pub max_dry_rounds: u64,
+    /// Optional draw-schedule anchor (unix seconds). When `Some(anchor)`, every
+    /// round closes on the fixed grid `anchor + k * draw_interval` (the first
+    /// grid point strictly after the round opens) instead of `opens_at +
+    /// draw_interval`. This removes the cumulative drift caused by keeper
+    /// latency between `closes_at` and the `Draw` that opens the next round, so
+    /// two independently deployed WinSaf instances (SAF and USDC) that share an
+    /// anchor keep drawing at the same wall-clock time indefinitely.
+    ///
+    /// `None` (default) preserves the legacy floating schedule.
+    /// `#[serde(default)]` so a Config persisted by a pre-upgrade code version
+    /// still deserializes across a code migration.
+    #[serde(default)]
+    pub schedule_anchor: Option<u64>,
 }
 
 /// Default `max_dry_rounds`: `0` = unlimited jackpot rollover until a 6-match hit.
@@ -274,6 +287,17 @@ pub struct Round {
     /// included in `pool`. `#[serde(default)]` for pre-upgrade rounds.
     #[serde(default)]
     pub top_up_total: Uint128,
+    /// Prize money carried INTO this round from earlier rounds when it opened
+    /// (rollover / cancel carry-forward), excluding promotional top-ups. Already
+    /// included in `pool`.
+    ///
+    /// It is what separates this round's own ticket money from the accumulated
+    /// jackpot: on `CancelRound` only `pool - rollover_in - top_up_total` (what
+    /// this round's tickets put in) is refunded, and the rest is carried forward,
+    /// so cancelling a round can never hand the jackpot to that round's buyers.
+    /// `#[serde(default)]` for pre-upgrade rounds (backfilled by `migrate`).
+    #[serde(default)]
+    pub rollover_in: Uint128,
 }
 
 impl Round {
@@ -285,10 +309,19 @@ impl Round {
         pool: Uint128,
         rolled_over_from: Option<u64>,
     ) -> Self {
-        Round::new_open_with_top_up(id, opens_at, closes_at, pool, rolled_over_from, Uint128::zero())
+        Round::new_open_with_top_up(
+            id,
+            opens_at,
+            closes_at,
+            pool,
+            rolled_over_from,
+            Uint128::zero(),
+        )
     }
 
     /// Like [`Self::new_open`] but records promotional seed folded from escrow.
+    /// `pool` is the full opening seed; the part that is not `top_up_total` is
+    /// recorded as `rollover_in`.
     pub fn new_open_with_top_up(
         id: u64,
         opens_at: u64,
@@ -297,6 +330,7 @@ impl Round {
         rolled_over_from: Option<u64>,
         top_up_total: Uint128,
     ) -> Self {
+        let rollover_in = pool.saturating_sub(top_up_total);
         Round {
             id,
             status: RoundStatus::Open,
@@ -312,7 +346,17 @@ impl Round {
             ticket_entropy: [0u8; 32],
             dry_streak_after: 0,
             top_up_total,
+            rollover_in,
         }
+    }
+
+    /// The part of `pool` paid in by THIS round's tickets: the pool minus money
+    /// carried in from earlier rounds and promotional top-ups. This is the only
+    /// amount a cancelled round may refund.
+    pub fn ticket_contributions(&self) -> Uint128 {
+        self.pool
+            .saturating_sub(self.rollover_in)
+            .saturating_sub(self.top_up_total)
     }
 }
 

@@ -73,8 +73,8 @@
       "minimum": 0.0
     },
     "max_dry_rounds": {
-      "description": "\"Must Be Won\" cap: the maximum number of consecutive dry rounds (no match-6 jackpot winner) the jackpot allocation may roll over before it is FORCED to roll DOWN to the best-matching lower tier present, guaranteeing distribution. `0` disables the feature (unlimited rollover — the legacy behaviour). Default 5.\n\n`#[serde(default = \"default_max_dry_rounds\")]` so a Config persisted by a pre-upgrade code version (which lacked this field) still deserializes across a code migration, defaulting to 5.",
-      "default": 5,
+      "description": "Optional \"Must Be Won\" cap: max consecutive dry rounds (no match-6 jackpot winner) before the jackpot allocation is FORCED to roll DOWN to the best-matching lower tier present. `0` = unlimited rollover (jackpot rolls until someone hits). Default `0`.\n\n`#[serde(default = \"default_max_dry_rounds\")]` so a Config persisted by a pre-upgrade code version (which lacked this field) still deserializes across a code migration.",
+      "default": 0,
       "type": "integer",
       "format": "uint64",
       "minimum": 0.0
@@ -126,6 +126,16 @@
     "rollover_on_no_winner": {
       "description": "If true and a round has no jackpot winner, its leftover prize pool rolls into the next round instead of being retained.",
       "type": "boolean"
+    },
+    "schedule_anchor": {
+      "description": "Optional draw-schedule anchor (unix seconds). When `Some(anchor)`, every round closes on the fixed grid `anchor + k * draw_interval` (the first grid point strictly after the round opens) instead of `opens_at + draw_interval`. This removes the cumulative drift caused by keeper latency between `closes_at` and the `Draw` that opens the next round, so two independently deployed WinSaf instances (SAF and USDC) that share an anchor keep drawing at the same wall-clock time indefinitely.\n\n`None` (default) preserves the legacy floating schedule. `#[serde(default)]` so a Config persisted by a pre-upgrade code version still deserializes across a code migration.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
     },
     "split": {
       "description": "Revenue split in bps (prize / referral / treasury), sums to 10_000.",

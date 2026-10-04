@@ -66,6 +66,15 @@
       "format": "uint64",
       "minimum": 0.0
     },
+    "rollover_in": {
+      "description": "Prize money carried into this round from earlier rounds (included in `pool`, excludes top-ups). The UI can show \"includes X rolled over\".",
+      "default": "0",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Uint128"
+        }
+      ]
+    },
     "status": {
       "$ref": "#/definitions/RoundStatus"
     },
@@ -73,6 +82,15 @@
       "type": "integer",
       "format": "uint64",
       "minimum": 0.0
+    },
+    "top_up_total": {
+      "description": "Cumulative promotional top-up usaf for this round (included in `pool`).",
+      "default": "0",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Uint128"
+        }
+      ]
     },
     "winning_numbers": {
       "type": [
