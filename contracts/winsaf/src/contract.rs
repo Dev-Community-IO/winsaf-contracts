@@ -34,7 +34,8 @@
 //! influence in advance. [`crate::verify::verify_drand`] enforces the BLS
 //! pairing, so in this mode delivery is permissionless: anyone may relay the
 //! beacon, and nobody (admin included) may cancel the round early to discard an
-//! outcome.
+//! outcome. The winning numbers come from `sha256(randomness || contract
+//! address)`, so instances closing on the same beacon still draw independently.
 //!
 //! `CommitReveal` is a defense-in-depth fallback for testnet. It is hardened so a
 //! single submitter cannot pick the outcome: the finalised seed mixes a
@@ -1112,9 +1113,11 @@ fn execute_draw(
         }
     };
 
-    // Derive the winning numbers deterministically from the verified randomness.
-    let winning = derive_winning_numbers(
+    // Derive the winning numbers from the verified randomness mixed with this
+    // contract's address, so lotteries sharing a beacon draw independently.
+    let winning = winning_numbers_for(
         randomness.as_slice(),
+        env.contract.address.as_str(),
         config.numbers_per_ticket,
         config.number_max,
     );
@@ -2643,6 +2646,20 @@ fn fold_ticket_entropy(prev: &[u8; 32], buyer: &Addr, ticket_id: &str, picks: &[
     sha256(&buf)
 }
 
+/// The winning numbers a draw produces for the lottery at `contract`:
+/// `derive_winning_numbers(sha256(randomness || contract))`.
+///
+/// Instances that close together (SAF and USDC share the 08:36 UTC grid) consume
+/// the same drand beacon. Mixing in the contract address (its bech32 string)
+/// gives each lottery its own numbers, and anyone can recompute them from the
+/// public beacon and the address.
+fn winning_numbers_for(randomness: &[u8], contract: &str, count: u8, number_max: u8) -> Vec<u8> {
+    let mut preimage = Vec::with_capacity(randomness.len() + contract.len());
+    preimage.extend_from_slice(randomness);
+    preimage.extend_from_slice(contract.as_bytes());
+    derive_winning_numbers(&sha256(&preimage), count, number_max)
+}
+
 /// Derive the winning numbers from verified randomness: `count` distinct values
 /// in `1..=number_max`, sorted ascending.
 fn derive_winning_numbers(randomness: &[u8], count: u8, number_max: u8) -> Vec<u8> {
@@ -3003,7 +3020,12 @@ mod tests {
             ExecuteMsg::Draw { round_id: 1 },
         )
         .unwrap();
-        derive_winning_numbers(randomness.as_slice(), 6, 45)
+        winning_for(randomness.as_slice())
+    }
+
+    /// What a draw of this (mock) contract yields for `randomness`.
+    fn winning_for(randomness: &[u8]) -> Vec<u8> {
+        winning_numbers_for(randomness, mock_env().contract.address.as_str(), 6, 45)
     }
 
     fn cfg(deps: &OD) -> Config {
@@ -3923,7 +3945,7 @@ mod tests {
         let (mut deps, api, env, _admin, submitter) = setup();
         let buyer = mk(&api, "buyer");
         let randomness = HexBinary::from(vec![7u8; 32]);
-        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        let winning = winning_for(randomness.as_slice());
 
         // Jackpot ticket (matches winning) + a quick-pick.
         buy(&mut deps, &env, &buyer, 1, Some(winning.clone()), None).unwrap();
@@ -3976,7 +3998,7 @@ mod tests {
         .unwrap();
 
         let randomness = HexBinary::from(vec![0x11u8; 32]);
-        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        let winning = winning_for(randomness.as_slice());
         let matches = winning
             .iter()
             .filter(|w| [1, 2, 3, 4, 5, 6].contains(w))
@@ -4142,7 +4164,7 @@ mod tests {
             ExecuteMsg::Draw { round_id },
         )
         .unwrap();
-        derive_winning_numbers(randomness.as_slice(), 6, 45)
+        winning_for(randomness.as_slice())
     }
 
     #[test]
@@ -4163,7 +4185,7 @@ mod tests {
         for (i, b) in rand_bytes.iter().enumerate() {
             let round_id = (i + 1) as u64;
             let randomness = HexBinary::from(vec![*b; 32]);
-            let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+            let winning = winning_for(randomness.as_slice());
             buy(
                 &mut deps,
                 &env,
@@ -4234,7 +4256,7 @@ mod tests {
 
         // Round 1: dry (match 4 only) -> streak 1.
         let rnd1 = HexBinary::from(vec![0x41; 32]);
-        let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
+        let w1 = winning_for(rnd1.as_slice());
         buy(
             &mut deps,
             &env,
@@ -4258,7 +4280,7 @@ mod tests {
 
         // Round 2: dry again -> streak 2.
         let rnd2 = HexBinary::from(vec![0x42; 32]);
-        let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
+        let w2 = winning_for(rnd2.as_slice());
         buy(
             &mut deps,
             &env,
@@ -4282,7 +4304,7 @@ mod tests {
 
         // Round 3: NATURAL jackpot win (match 6) -> resets streak to 0, no force.
         let rnd3 = HexBinary::from(vec![0x43; 32]);
-        let w3 = derive_winning_numbers(rnd3.as_slice(), 6, 45);
+        let w3 = winning_for(rnd3.as_slice());
         buy(&mut deps, &env, &buyer, 1, Some(w3.clone()), None).unwrap();
         buy(
             &mut deps,
@@ -4311,7 +4333,7 @@ mod tests {
 
         // Round 1: dry, no lower-tier winner (match 0) -> streak 1.
         let rnd1 = HexBinary::from(vec![0x51; 32]);
-        let w1 = derive_winning_numbers(rnd1.as_slice(), 6, 45);
+        let w1 = winning_for(rnd1.as_slice());
         buy(
             &mut deps,
             &env,
@@ -4335,7 +4357,7 @@ mod tests {
 
         // Round 2: hits the cap and would force, but NO ticket matches >= 3.
         let rnd2 = HexBinary::from(vec![0x52; 32]);
-        let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
+        let w2 = winning_for(rnd2.as_slice());
         buy(
             &mut deps,
             &env,
@@ -4376,7 +4398,7 @@ mod tests {
 
         // max_dry_rounds = 1: the very first dry round forces immediately.
         let rnd = HexBinary::from(vec![0x61; 32]);
-        let w = derive_winning_numbers(rnd.as_slice(), 6, 45);
+        let w = winning_for(rnd.as_slice());
         // Two tier-3 winners so the jackpot alloc splits (exercises remainder).
         let buyer2 = mk(&api, "buyer2");
         buy(
@@ -4440,7 +4462,7 @@ mod tests {
 
         // Round 2: SINGLE player, dry (match 4 winner). Still neutral -> streak 0.
         let rnd2 = HexBinary::from(vec![0x72; 32]);
-        let w2 = derive_winning_numbers(rnd2.as_slice(), 6, 45);
+        let w2 = winning_for(rnd2.as_slice());
         buy(
             &mut deps,
             &env,
@@ -4459,7 +4481,7 @@ mod tests {
 
         // Round 3: TWO players, dry -> now it counts -> streak 1.
         let rnd3 = HexBinary::from(vec![0x73; 32]);
-        let w3 = derive_winning_numbers(rnd3.as_slice(), 6, 45);
+        let w3 = winning_for(rnd3.as_slice());
         buy(
             &mut deps,
             &env,
@@ -4501,7 +4523,7 @@ mod tests {
         for (i, byte) in [0x81u8, 0x82u8].into_iter().enumerate() {
             let round_id = (i + 1) as u64;
             let rnd = HexBinary::from(vec![byte; 32]);
-            let w = derive_winning_numbers(rnd.as_slice(), 6, 45);
+            let w = winning_for(rnd.as_slice());
             buy(
                 &mut deps,
                 &env,
@@ -4537,7 +4559,7 @@ mod tests {
         let (mut deps, api, env, _admin, submitter) = setup();
         let buyer = mk(&api, "buyer");
         let randomness = HexBinary::from(vec![7u8; 32]);
-        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        let winning = winning_for(randomness.as_slice());
         buy(&mut deps, &env, &buyer, 1, Some(winning.clone()), None).unwrap();
 
         let mut env2 = env.clone();
@@ -4631,7 +4653,7 @@ mod tests {
         let buyer = mk(&api, "buyer");
         let stranger = mk(&api, "stranger");
         let randomness = HexBinary::from(vec![7u8; 32]);
-        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        let winning = winning_for(randomness.as_slice());
         buy(&mut deps, &env, &buyer, 1, Some(winning), None).unwrap();
         run_draw(&mut deps, &env, &submitter, randomness);
 
@@ -5204,7 +5226,7 @@ mod tests {
         let buyer = mk(&api, "buyer");
         let referrer = mk(&api, "referrer");
         let randomness = HexBinary::from(vec![7u8; 32]);
-        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        let winning = winning_for(randomness.as_slice());
 
         // buyer binds a referrer, buys a jackpot ticket + extras.
         execute(
@@ -5455,7 +5477,7 @@ mod tests {
         let buyer = mk(&api, "buyer");
         let owner = mk(&api, "xp_redeemer");
         let randomness = HexBinary::from(vec![7u8; 32]);
-        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        let winning = winning_for(randomness.as_slice());
 
         // A normal paid buy (non-winning quick-pick would be fine, but give it a
         // 3-match so the pool has multiple tiers) and a granted JACKPOT ticket.
@@ -6202,7 +6224,7 @@ mod tests {
         let (mut deps, api, env, _admin, submitter) = setup();
         let buyer = mk(&api, "buyer");
         let randomness = HexBinary::from(vec![7u8; 32]);
-        let winning = derive_winning_numbers(randomness.as_slice(), 6, 45);
+        let winning = winning_for(randomness.as_slice());
         // Single jackpot ticket: tiers 3/4/5 have no winners, so ~40% of the pool
         // is unassigned leftover that must roll forward.
         buy(&mut deps, &env, &buyer, 1, Some(winning.clone()), None).unwrap();
@@ -6865,6 +6887,27 @@ mod tests {
         HexBinary::from_hex(s).unwrap()
     }
 
+    /// Mainnet 2026-10-05: SAF round 77 and USDC round 6 consumed the same drand
+    /// quicknet beacon (round 32795333) and, under code 11, drew the same numbers.
+    /// With the contract address mixed in, each lottery gets its own. Expected
+    /// values cross-checked with an independent Python port of the derivation.
+    #[test]
+    fn lotteries_sharing_a_beacon_draw_different_numbers() {
+        let beacon = hex("861afd5c293e3525d437b5960f0757e352c63bc74ff8ff29ef0c57d2f818ac3f");
+        let saf = "addr_safro1ufs3tlq4umljk0qfe8k5ya0x6hpavn897u2cnf9k0en9jr7qarqq3sdf24";
+        let usdc = "addr_safro1x3960tw9cml6xsqtvzt4gmw3scauaxdd83rhs9dmlpjfjf9z9s7q7nqm50";
+        // Code 11 behaviour (what both lotteries actually drew that day).
+        assert_eq!(derive_winning_numbers(beacon.as_slice(), 6, 45), vec![5, 12, 28, 29, 40, 45]);
+        assert_eq!(
+            winning_numbers_for(beacon.as_slice(), saf, 6, 45),
+            vec![8, 22, 24, 28, 37, 39]
+        );
+        assert_eq!(
+            winning_numbers_for(beacon.as_slice(), usdc, 6, 45),
+            vec![11, 21, 22, 25, 35, 45]
+        );
+    }
+
     #[test]
     fn bls_verifies_real_quicknet_beacons() {
         let api = MockApi::default();
@@ -6976,7 +7019,7 @@ mod tests {
         assert_eq!(settled.status, RoundStatus::Settled);
         assert_eq!(
             settled.winning_numbers.unwrap(),
-            derive_winning_numbers(hex(BEACON_32M_RND).as_slice(), 6, 45)
+            winning_for(hex(BEACON_32M_RND).as_slice())
         );
     }
 

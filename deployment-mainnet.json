@@ -4,15 +4,16 @@
   "admin": "addr_safro1h2jz462m97xsxdar6wew85s48dkh6ljga8st0p",
   "contract": "addr_safro1ufs3tlq4umljk0qfe8k5ya0x6hpavn897u2cnf9k0en9jr7qarqq3sdf24",
   "contractUsdc": "addr_safro1x3960tw9cml6xsqtvzt4gmw3scauaxdd83rhs9dmlpjfjf9z9s7q7nqm50",
-  "codeId": 11,
+  "codeId": 12,
   "feeshareWithdrawer": "addr_safro1ln8usrn9egtmd9mq3ajnrcgzvp8uup68kq5t2x",
   "scheduleAnchor": 1790757362,
-  "note": "2026-09-29: stored code 9 (tx 03A62DDE…). Migrated SAF 6->9 with schedule_anchor=1790757362 (tx 0E1FD66E…). Instantiated USDC (tx 7788EDCD…). Feeshare registered on both contracts to addr_safro1ln8usrn9egtmd9mq3ajnrcgzvp8uup68kq5t2x (SAF tx D0AD23DB, USDC tx 67A703B1). 2026-10-05: stored code 11 (tx 0C1BCF8B7521D9768DE7088A337A7E83999CA661132488282A91152F6262CFA0, checksum eebdec52…ab12, instantiate limited to admin). Migrated SAF 9->11 (tx 79365B809C247BE100FBD8C0833842791DEF893B917BECD1AF36C77894984AA7, rollover_in backfill 12674082887) and USDC 9->11 (tx 6FF9774DCA6FDF6CB1E8D6CF040E3F9E86A10C2389E3150ECDE7F2C3B7A8EC96, backfill 12950000), switching both to drand quicknet with on-chain BLS verification.",
+  "note": "2026-09-29: stored code 9 (tx 03A62DDE…). Migrated SAF 6->9 with schedule_anchor=1790757362 (tx 0E1FD66E…). Instantiated USDC (tx 7788EDCD…). Feeshare registered on both contracts to addr_safro1ln8usrn9egtmd9mq3ajnrcgzvp8uup68kq5t2x (SAF tx D0AD23DB, USDC tx 67A703B1). 2026-10-05: stored code 11 (tx 0C1BCF8B7521D9768DE7088A337A7E83999CA661132488282A91152F6262CFA0, checksum eebdec52…ab12, instantiate limited to admin). Migrated SAF 9->11 (tx 79365B809C247BE100FBD8C0833842791DEF893B917BECD1AF36C77894984AA7, rollover_in backfill 12674082887) and USDC 9->11 (tx 6FF9774DCA6FDF6CB1E8D6CF040E3F9E86A10C2389E3150ECDE7F2C3B7A8EC96, backfill 12950000), switching both to drand quicknet with on-chain BLS verification. 2026-10-05 (later): stored code 12 (tx 7BD2C2D5B5A9AB0E1DF23D5FC875B4D0011179A6311A931CFE09D0F677ED30BC, checksum 48313683…3119) and migrated SAF 11->12 (tx 7E83111A98B6A445B01FB7C4F4F970F2011BECD0CBA95D3DCEC345E3F36E10D9) and USDC 11->12 (tx 995B95E755F254B650B69DE7571AB0109D41CE68EEAE80E972009C9A27B2C85B): winning numbers now come from sha256(beacon randomness || contract address), so the two lotteries no longer share numbers.",
   "randomness": {
     "mode": "drand",
     "verify": "bls",
     "drandChainHash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
     "drandGenesisTime": 1692803367,
-    "drandPeriod": 3
+    "drandPeriod": 3,
+    "numbers": "derive(sha256(randomness || contract_address)) since code 12"
   }
 }
